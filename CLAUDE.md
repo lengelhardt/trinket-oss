@@ -51,3 +51,13 @@ remembered number from a different session.
 - **Do not restate in prose a value that a test asserts.** A hand-counted expectation
   written into a plan ("the cards are numbered 6 and 8" — they are 6 and 7) is a
   second copy that can be wrong and that nothing checks. Point at the test instead.
+- **When you do find a restated value is wrong, grep for it before fixing.** That one
+  took three review rounds precisely because it was corrected one occurrence at a
+  time: the same wrong number was in three places in the plan, one of which
+  contradicted the browser spec that ships the correct value. Fixing the line you
+  were shown leaves the others, and the next reviewer finds them one by one.
+- **Then check for anything describing the disagreement you just resolved.** A comment
+  elsewhere read "the plan's prose says 6 and 8; that is an off-by-one" — correct when
+  written, and stale the moment the plan was fixed, leaving a reader hunting for a
+  contradiction that no longer exists. Notes that reconcile two documents are a second
+  copy of the same fact and rot the same way; state the fact self-containedly instead.
