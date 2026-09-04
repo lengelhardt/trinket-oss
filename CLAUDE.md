@@ -12,3 +12,42 @@ Firestore bills per document read and write, so be vigilant when writing or revi
 - Be especially careful in hot paths: embed views, trinket loads, course page loads.
 
 The Firestore backend lives in `lib/db/firestore-backend.js`. The MongoDB backend is still present for local/legacy use.
+
+## Measuring performance in the Pyodide embed
+
+Two traps, both of which have produced wrong conclusions and a reverted commit:
+
+- **Wall-clock timing is meaningless when the Browser pane is hidden.** The pane
+  throttles `setTimeout` to ~1s and does not fire `requestAnimationFrame` at all,
+  and the console flush is driven by both. A measurement that looked like 8 ms per
+  operation was mostly throttled timer latency. Measure main-thread blocking with
+  `PerformanceObserver({entryTypes:['longtask']})` instead — it reports real work
+  and is immune to throttling. If a run reports `frames: 1`, rAF is not firing and
+  any wall-clock number from it is worthless.
+- **Warm the interpreter before timing anything.** A cold `sympy.integrate()` costs
+  seconds and will dominate whatever you think you are measuring. Run the setup
+  once, then measure. A "control" that runs second is warm and is not a control.
+
+A/B against the same build with the variable changed, rather than comparing to a
+remembered number from a different session.
+
+## Local stacks
+
+- `docker-compose.yml` (mongo shape, :3000) and `docker-compose.gcr.yml` (GCP shape,
+  :3001) share a Compose project name and both define a service called `app`.
+  Bringing one up therefore **removes the other's app container**. Run one at a time,
+  or expect to recreate the other afterwards.
+- `public/css` and `public/components` are masked by volumes, so they come from the
+  image, not your working tree. Editing SCSS or vendoring a new component and then
+  restarting is not enough: Compose also **preserves anonymous volumes across
+  container recreation**, so the old assets keep being served and the new ones 404
+  silently. Rebuild and recreate with `-V` (`--renew-anon-volumes`).
+
+## Referencing code from docs
+
+- Pair every `file:line` reference with a **stable string to grep for**. Line numbers
+  drift as `main` moves; the anchor is what still resolves a month later. See the
+  anchor table in `docs/superpowers/specs/2026-09-03-sympy-math-output-design.md`.
+- **Do not restate in prose a value that a test asserts.** A hand-counted expectation
+  written into a plan ("the cards are numbered 6 and 8" — they are 6 and 7) is a
+  second copy that can be wrong and that nothing checks. Point at the test instead.
