@@ -1880,6 +1880,12 @@ function runStepThrough() {
     debugRecording = false;
     $('#debug-recording').addClass('hide');
     if (!debugRec) $('#debug-launch').removeClass('hide');
+    // Step-through does not go through finishRun(), but it re-runs the program
+    // on the page's Pyodide and can leave a different figure behind. Always
+    // 'main': the recorder never uses the worker.
+    if (window.trinketPlotpolish) {
+      try { trinketPlotpolish.afterRun('main'); } catch (e) {}
+    }
   }
 
   ensurePyodide().then(function() {
@@ -2811,6 +2817,13 @@ function finishRun(serializedCode, err) {
     try { renderVariables(snapshotVariables()); } catch (e) {}
   }
 
+  // Refresh the plot-style panel against the figure this run left behind.
+  // Skipped when a rerun is queued: startRun() below runs synchronously and
+  // sets running = true, which the panel's backend would then refuse.
+  if (!rerunQueued && window.trinketPlotpolish) {
+    try { trinketPlotpolish.afterRun(window.__trinketRuntime); } catch (e) {}
+  }
+
   // A Run was clicked while the previous (VPython) run was being cancelled;
   // now that it has stopped, start the fresh run.
   if (rerunQueued) {
@@ -3291,7 +3304,22 @@ window.TrinketAPI = {
 
     editor.change(function() {
       api.triggerChange();
+      if (window.trinketPlotpolish) trinketPlotpolish.onEditorChange();
     });
+
+    // The plot-style panel lives in public/js/plugins/plotpolish-adapter.js.
+    // This file is a closure, so api/editor/pyodide/running are not reachable
+    // from out there; hand over the few it needs. window.trinketPlotpolish is
+    // undefined unless features.plotStyle is on, so this is a no-op when off.
+    if (window.trinketPlotpolish) {
+      trinketPlotpolish.init({
+          api        : api
+        , getPyodide : function() { return pyodideReady ? pyodide : null; }
+        , isBusy     : function() {
+            return running || debugRecording || (workerClient && workerClient.isRunning());
+          }
+      });
+    }
 
     if (typeof api.draggable === 'function') {
       api.draggable(function() {});
