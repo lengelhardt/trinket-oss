@@ -153,11 +153,14 @@
   // Mounting
   // ---------------------------------------------------------------------
 
-  // #graphic is emptied by resetOutput() at the start of every run but the node
-  // itself persists, so it is a stable thing to position against. The panel is
-  // appended to #graphic-wrap, which is hidden until there is a figure -- the
-  // pill lives in the element's shadow root, so it inherits that and stays
-  // invisible until a figure exists.
+  // Both the panel and its position anchor go on #graphic-wrap, not #graphic.
+  // #graphic is the obvious choice -- resetOutput() empties it every run while
+  // the node itself persists -- but it is also *taller* than the wrap, which
+  // scrolls (overflow: auto). Anchoring to #graphic puts the pill at the
+  // figure's top-right, which is above the wrap's scroll viewport and so off
+  // screen. #graphic-wrap persists just as reliably and is the visible box.
+  // The wrap is hidden until showGraphic(); the pill lives in the element's
+  // shadow root, so it inherits that and stays invisible until a figure exists.
   function mount() {
     if (mounted) return true;
     var wrap = document.getElementById('graphic-wrap');
@@ -169,7 +172,7 @@
     // properties; without this the panel follows the student's OS dark mode.
     panel.setAttribute('theme', 'light');
     panel.sink = sink;
-    panel.figureElement = fig;
+    panel.figureElement = wrap;
     // Trinket re-applies these before every run, so the block must not fight
     // them; plotpolish leaves keys listed here out of what it writes.
     panel.hostRcKeys = ['figure.autolayout'];
