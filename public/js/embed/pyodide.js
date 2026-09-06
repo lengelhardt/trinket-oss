@@ -3304,21 +3304,29 @@ window.TrinketAPI = {
 
     editor.change(function() {
       api.triggerChange();
-      if (window.trinketPlotpolish) trinketPlotpolish.onEditorChange();
+      // Guarded like the afterRun hooks: editor.change is single-owner, so a
+      // throw from the optional plugin would take the change pipeline with it.
+      if (window.trinketPlotpolish) {
+        try { trinketPlotpolish.onEditorChange(); } catch (e) {}
+      }
     });
 
     // The plot-style panel lives in public/js/plugins/plotpolish-adapter.js.
     // This file is a closure, so api/editor/pyodide/running are not reachable
     // from out there; hand over the few it needs. window.trinketPlotpolish is
     // undefined unless features.plotStyle is on, so this is a no-op when off.
+    // Guarded: this runs inside initialize(), so an exception here would take
+    // out everything after it -- the dragbar below included.
     if (window.trinketPlotpolish) {
-      trinketPlotpolish.init({
-          api        : api
-        , getPyodide : function() { return pyodideReady ? pyodide : null; }
-        , isBusy     : function() {
-            return running || debugRecording || (workerClient && workerClient.isRunning());
-          }
-      });
+      try {
+        trinketPlotpolish.init({
+            api        : api
+          , getPyodide : function() { return pyodideReady ? pyodide : null; }
+          , isBusy     : function() {
+              return running || debugRecording || (workerClient && workerClient.isRunning());
+            }
+        });
+      } catch (e) {}
     }
 
     if (typeof api.draggable === 'function') {

@@ -238,7 +238,10 @@
       if (panel.backend !== want) {
         panel.backend = want;   // the setter does not refresh on its own
       }
-      panel.refresh();
+      // refresh() is async, so the try/catch around afterRun() in pyodide.js
+      // cannot contain it: that returns before the promise settles. Swallow it
+      // here instead, or a failure surfaces as an unhandled rejection.
+      panel.refresh().catch(function() {});
     }
   };
 })(window, document);
