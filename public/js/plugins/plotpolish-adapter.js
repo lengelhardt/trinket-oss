@@ -186,7 +186,19 @@
   // pandas HTML table or a print-only program should not get a style pill.
   function hasFigure() {
     var fig = document.getElementById('graphic');
-    return !!(fig && fig.querySelector('canvas, img.worker-figure'));
+    if (!fig) return false;
+    // A worker run posts the figure back as an image.
+    if (fig.querySelector('img.worker-figure')) return true;
+    // Any <canvas> is not enough: setupGlowScene() puts a #glowscript
+    // container inside #graphic and Web VPython draws its 3D scene on a canvas
+    // there, so matching canvases alone mounted the plot-style pill over a
+    // VPython scene and offered to write matplotlib rcParams into a VPython
+    // program. Only count a canvas that is not inside that container.
+    var canvases = fig.querySelectorAll('canvas');
+    for (var i = 0; i < canvases.length; i++) {
+      if (!canvases[i].closest('#glowscript')) return true;
+    }
+    return false;
   }
 
   // ---------------------------------------------------------------------
