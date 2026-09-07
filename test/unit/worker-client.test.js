@@ -396,9 +396,19 @@ describe('file outputs', () => {
     const sent = made[0].posted.filter(m => m.type === 'fs-read');
     expect(sent.length).toBe(1);
     expect(sent[0].name).toBe('plot.png');
-    const bytes = new Uint8Array([137, 80, 78, 71]);
-    made[0].onmessage({ data: { type: 'fs-read-result', id: sent[0].id, name: 'plot.png', bytes } });
-    await expect(p).resolves.toBe(bytes);
+    made[0].onmessage({ data: {
+      type: 'fs-read-result', id: sent[0].id, name: 'plot.png',
+      bytes: new Uint8Array([137, 80, 78, 71]),   // the PNG magic number
+    } });
+
+    // By value, not by identity. A real reply crosses postMessage, so the bytes
+    // are structured-cloned and can never be the same object the worker sent --
+    // `toBe` pinned a property of this mock that production cannot have, and
+    // would have failed on a harmless change like re-wrapping the reply in a
+    // fresh Uint8Array. Raised in the review of #253.
+    const got = await p;
+    expect(got).toBeInstanceOf(Uint8Array);
+    expect(Array.from(got)).toEqual([137, 80, 78, 71]);
   });
 
   it('resolves empty when called AFTER the worker is gone (the pre-call guard)', async () => {
