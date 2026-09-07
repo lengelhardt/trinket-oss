@@ -29,6 +29,33 @@
       if (run) run.resolve();
     }
 
+    // Terminating the worker orphans every resolver still in `pending`: no
+    // reply is coming, and only a reply deletes them, so each caller's promise
+    // would never settle. The `if (!worker)` guards in snapshot() / listFiles()
+    // / readFile() cover a request made AFTER the worker is gone; a request
+    // already in flight when it dies needs this. Raised in the review of #253,
+    // and it was already true of snapshot() before this branch added two more
+    // callers to the same shape.
+    //
+    // NOT folded into settle(): that also runs on ordinary run completion,
+    // where an in-flight snapshot or listing is perfectly valid and must be
+    // left alone.
+    //
+    // Each caller gets its own empty answer rather than a rejection. Every call
+    // site already treats "nothing" as a normal outcome, and rejecting here
+    // would surface as an unhandled rejection from a run that merely stopped.
+    function flushPending() {
+      var ids = Object.keys(pending);
+      for (var i = 0; i < ids.length; i++) {
+        var id = ids[i];
+        var resolve = pending[id];
+        delete pending[id];
+        // readFile answers with bytes-or-null; snapshot and listFiles answer
+        // with arrays. Keyed off the id prefix each one mints.
+        try { resolve(id.indexOf('fsrd-') === 0 ? null : []); } catch (e) {}
+      }
+    }
+
     function onMessage(e) {
       var msg = (e && e.data) || {};
 
@@ -210,6 +237,7 @@
       // cancellation can never reach.
       stop: function() {
         if (worker) { worker.terminate(); worker = null; }
+        flushPending();
         settle();
       },
 
@@ -230,6 +258,7 @@
       discardWorker: function() {
         var had = !!worker;
         if (worker) { worker.terminate(); worker = null; }
+        flushPending();
         settle();
         return had;
       },
@@ -314,6 +343,7 @@
 
       dispose: function() {
         if (worker) { worker.terminate(); worker = null; }
+        flushPending();
         current = null;
       }
     };

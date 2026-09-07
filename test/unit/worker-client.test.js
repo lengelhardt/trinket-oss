@@ -352,6 +352,17 @@ describe('variable snapshot over the channel', () => {
     await expect(p).resolves.toEqual([]);
   });
 
+  // Same defect as the file-output requests, and it predates them: snapshot()
+  // has always registered its resolver in `pending` and relied on a reply to
+  // clear it. flushPending() fixes all three at once, so pin the one that was
+  // already shipping.
+  it('resolves a snapshot already in flight when the worker is stopped', async () => {
+    const { client } = await bootedClient();
+    const p = client.snapshot();
+    client.stop();
+    await expect(p).resolves.toEqual([]);
+  });
+
   it('resolves to an empty array if the worker is gone (stopped)', async () => {
     // Terminating discards the namespace, so a snapshot request after a stop can
     // never be answered. It must not hang the caller.
@@ -390,11 +401,34 @@ describe('file outputs', () => {
     await expect(p).resolves.toBe(bytes);
   });
 
-  it('resolves empty rather than hanging when the worker is gone', async () => {
+  it('resolves empty when called AFTER the worker is gone (the pre-call guard)', async () => {
     const { client } = await bootedClient();
     client.discardWorker();
     await expect(client.listFiles()).resolves.toEqual([]);
     await expect(client.readFile('plot.png')).resolves.toBe(null);
+  });
+
+  // The half the guard cannot reach, and the reason flushPending() exists: the
+  // request is posted while the worker is alive, so the resolver is already in
+  // `pending` when it is terminated. Only a reply deletes from `pending`, and
+  // no reply is coming -- so without the flush these promises never settle and
+  // the caller waits forever. Raised in the review of #253.
+  //
+  // Note what this means about the test above: it passes on the `if (!worker)`
+  // guard alone and would keep passing with the bug present. It was not cover
+  // for this at all, despite its original name saying "rather than hanging".
+  it('resolves a listing already in flight when the worker is discarded', async () => {
+    const { client } = await bootedClient();
+    const p = client.listFiles();
+    client.discardWorker();
+    await expect(p).resolves.toEqual([]);
+  });
+
+  it('resolves a read already in flight when the worker is stopped', async () => {
+    const { client } = await bootedClient();
+    const p = client.readFile('plot.png');
+    client.stop();
+    await expect(p).resolves.toBe(null);
   });
 
   it('ignores a reply whose id nothing is waiting on', async () => {

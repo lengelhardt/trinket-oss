@@ -1841,16 +1841,24 @@ function renderFileOutputs(entries, read) {
 
   entries.forEach(function(entry) {
     var tooBig = entry.size > FILE_OUTPUT_MAX_BYTES;
-    var $a = $('<a class="file-output" role="button" tabindex="0"></a>');
+    // Stays an <a> either way so the stylesheet's `a.file-output` rules apply,
+    // but role/tabindex are added ONLY when there is something to activate. A
+    // too-large entry carried both, so a screen reader announced a button and
+    // the keyboard stopped on it, with no handler behind either. Raised in the
+    // review of #253.
+    var $a = $('<a class="file-output"></a>');
     $a.text(entry.name);
     $a.append($('<span class="file-output-size"></span>').text(
       ' (' + fileOutputSizeLabel(entry.size) + (tooBig ? ', too large to download' : '') + ')'));
 
     if (tooBig) {
+      $a.attr('aria-disabled', 'true');
       $a.attr('title', 'This file is over ' + fileOutputSizeLabel(FILE_OUTPUT_MAX_BYTES) +
         ' and cannot be downloaded from the browser.');
       $a.css({ color: '#7b8b98', cursor: 'default' });
     } else {
+      $a.attr('role', 'button');
+      $a.attr('tabindex', '0');
       $a.attr('title', 'Download ' + entry.name);
       var save = function() {
         Promise.resolve(read(entry.name)).then(function(bytes) {
