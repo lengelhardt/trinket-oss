@@ -114,4 +114,32 @@ describe('worker figure save — the page half', () => {
     const code = src.split('\n').filter((l) => !/^\s*(\/\/|\*)/.test(l)).join('\n');
     expect(code).not.toContain('toDataURL');
   });
+
+  // #253 was about to add a THIRD Blob downloader to this file, so the two that
+  // were here got folded into one helper. Pinning the count is the point: the
+  // failure mode is a copy. A new caller that builds its own URL silently
+  // reintroduces both bugs the fold fixed.
+  it('has exactly one Blob download path, and the save goes through it', () => {
+    const objectUrls = src.match(/URL\.createObjectURL/g) || [];
+    expect(objectUrls.length).toBe(1);
+    expect(src).toContain("downloadBlob(bytes, 'plot.' + fmt");
+  });
+
+  // The two bugs, both raised in the review of #256 and both true until the
+  // fold: the save path had no try/catch, so a throw from any of the DOM/Blob
+  // calls killed the run that produced the figure; and it revoked the object
+  // URL on a 0 ms timeout, which Safari can read as cancelling the download it
+  // has not finished reading.
+  it('guards the download against a throw, and revokes late enough for Safari', () => {
+    const from = src.indexOf('function downloadBlob(');
+    expect(from).toBeGreaterThan(-1);
+    const body = src.slice(from, src.indexOf('\n}\n', from) + 3);
+
+    expect(body).toContain('try {');
+    expect(body).toContain('catch (e)');
+    expect(body).toContain('finally {');
+    // The Blob work must be INSIDE the try, not ahead of it.
+    expect(body.indexOf('try {')).toBeLessThan(body.indexOf('URL.createObjectURL'));
+    expect(body).not.toMatch(/revokeObjectURL\(url\);\s*\},\s*0\)/);
+  });
 });

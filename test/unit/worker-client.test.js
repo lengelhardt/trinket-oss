@@ -362,48 +362,48 @@ describe('variable snapshot over the channel', () => {
     client.stop();
     await expect(client.snapshot()).resolves.toEqual([]);
   });
+});
 
-  // #253: the files a program wrote. Same request/response shape as snapshot(),
-  // and the same guarantee — a terminated worker resolves rather than hangs.
-  describe('file outputs', () => {
-    it('asks the worker for a listing and resolves with its entries', async () => {
-      const { client, made } = await bootedClient();
-      const p = client.listFiles();
-      const sent = made[0].posted.filter(m => m.type === 'fs-list');
-      expect(sent.length).toBe(1);
-      made[0].onmessage({ data: {
-        type: 'fs-list-result', id: sent[0].id,
-        entries: [{ name: 'plot.png', size: 19648, isDir: false }]
-      } });
-      await expect(p).resolves.toEqual([{ name: 'plot.png', size: 19648, isDir: false }]);
-    });
+// #253: the files a program wrote. Same request/response shape as snapshot(),
+// and the same guarantee — a terminated worker resolves rather than hangs.
+describe('file outputs', () => {
+  it('asks the worker for a listing and resolves with its entries', async () => {
+    const { client, made } = await bootedClient();
+    const p = client.listFiles();
+    const sent = made[0].posted.filter(m => m.type === 'fs-list');
+    expect(sent.length).toBe(1);
+    made[0].onmessage({ data: {
+      type: 'fs-list-result', id: sent[0].id,
+      entries: [{ name: 'plot.png', size: 19648, isDir: false }]
+    } });
+    await expect(p).resolves.toEqual([{ name: 'plot.png', size: 19648, isDir: false }]);
+  });
 
-    it('reads one file by name and resolves with its bytes', async () => {
-      const { client, made } = await bootedClient();
-      const p = client.readFile('plot.png');
-      const sent = made[0].posted.filter(m => m.type === 'fs-read');
-      expect(sent.length).toBe(1);
-      expect(sent[0].name).toBe('plot.png');
-      const bytes = new Uint8Array([137, 80, 78, 71]);
-      made[0].onmessage({ data: { type: 'fs-read-result', id: sent[0].id, name: 'plot.png', bytes } });
-      await expect(p).resolves.toBe(bytes);
-    });
+  it('reads one file by name and resolves with its bytes', async () => {
+    const { client, made } = await bootedClient();
+    const p = client.readFile('plot.png');
+    const sent = made[0].posted.filter(m => m.type === 'fs-read');
+    expect(sent.length).toBe(1);
+    expect(sent[0].name).toBe('plot.png');
+    const bytes = new Uint8Array([137, 80, 78, 71]);
+    made[0].onmessage({ data: { type: 'fs-read-result', id: sent[0].id, name: 'plot.png', bytes } });
+    await expect(p).resolves.toBe(bytes);
+  });
 
-    it('resolves empty rather than hanging when the worker is gone', async () => {
-      const { client } = await bootedClient();
-      client.discardWorker();
-      await expect(client.listFiles()).resolves.toEqual([]);
-      await expect(client.readFile('plot.png')).resolves.toBe(null);
-    });
+  it('resolves empty rather than hanging when the worker is gone', async () => {
+    const { client } = await bootedClient();
+    client.discardWorker();
+    await expect(client.listFiles()).resolves.toEqual([]);
+    await expect(client.readFile('plot.png')).resolves.toBe(null);
+  });
 
-    it('ignores a reply whose id nothing is waiting on', async () => {
-      const { client, made } = await bootedClient();
-      const p = client.listFiles();
-      const id = made[0].posted.filter(m => m.type === 'fs-list')[0].id;
-      // A stale reply from a worker we already replaced must not settle this one.
-      made[0].onmessage({ data: { type: 'fs-list-result', id: 'fsls-stale', entries: [{ name: 'x' }] } });
-      made[0].onmessage({ data: { type: 'fs-list-result', id, entries: [] } });
-      await expect(p).resolves.toEqual([]);
-    });
+  it('ignores a reply whose id nothing is waiting on', async () => {
+    const { client, made } = await bootedClient();
+    const p = client.listFiles();
+    const id = made[0].posted.filter(m => m.type === 'fs-list')[0].id;
+    // A stale reply from a worker we already replaced must not settle this one.
+    made[0].onmessage({ data: { type: 'fs-list-result', id: 'fsls-stale', entries: [{ name: 'x' }] } });
+    made[0].onmessage({ data: { type: 'fs-list-result', id, entries: [] } });
+    await expect(p).resolves.toEqual([]);
   });
 });

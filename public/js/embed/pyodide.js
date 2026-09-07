@@ -1781,29 +1781,47 @@ function fileOutputSizeLabel(bytes) {
   return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
 }
 
-// Blob + <a download>, never a form and never an iframe: the embed CSP carries
-// `form-action 'none'` and test/lib/api/embed-csp-contract.test.js fails the
-// build if anything under public/js/embed/ creates or submits one (#224). Same
-// shape as the toolbar download at embed.js:786.
-function downloadProducedFile(name, bytes) {
+// The one Blob download path in this file. Blob + <a download>, never a form
+// and never an iframe: the embed CSP carries `form-action 'none'` and
+// test/lib/api/embed-csp-contract.test.js fails the build if anything under
+// public/js/embed/ creates or submits one (#224).
+//
+// Shared by the two callers that used to have a copy each -- the files a
+// program wrote (#253, below) and the matplotlib toolbar's Save (#252, in
+// handleWorkerFigure). Their copies had drifted apart on both points that
+// matter here, and the stricter answer is right in both cases:
+//
+//   * Errors. The save path had no try/catch, so a throw from any of the
+//     DOM/Blob calls killed the run that produced the file. Raised in the
+//     review of #256 and true until now.
+//   * Revoke timing. The save path revoked on a 0 ms timeout. Safari fetches
+//     the blob AFTER click() returns, so revoking that eagerly can cancel the
+//     download it just started -- a bug that only shows up on one browser, and
+//     the reason the generous delay below is deliberate rather than lazy.
+//
+// embed.js:795 keeps its own copy on purpose: it is a separate bundle, loaded
+// on pages that never load pyodide.js, so sharing would mean introducing a
+// shared module for one function.
+function downloadBlob(bytes, filename, mime) {
   if (!bytes) return;
   var url = null, link = null;
   try {
-    var blob = new Blob([bytes], { type: fileOutputMime(name) });
-    url = URL.createObjectURL(blob);
+    url = URL.createObjectURL(new Blob([bytes], { type: mime || 'application/octet-stream' }));
     link = document.createElement('a');
     link.href = url;
-    link.download = name;
+    link.download = filename;
     document.body.appendChild(link);
     link.click();
   } catch (e) {
-    // A failed save must never break the run that produced the file.
+    // Deliberately swallowed: a failed save must never break the run.
   } finally {
     if (link && link.parentNode) link.parentNode.removeChild(link);
-    // Revoked on a turn of the event loop: Safari reads the blob after click()
-    // returns, so revoking synchronously can cancel the save it just started.
     if (url) window.setTimeout(function() { URL.revokeObjectURL(url); }, 30000);
   }
+}
+
+function downloadProducedFile(name, bytes) {
+  downloadBlob(bytes, name, fileOutputMime(name));
 }
 
 // `read` is the runtime's byte reader: synchronous on the main thread, a
@@ -3243,14 +3261,9 @@ function handleWorkerFigure(msg) {
     var fmt = String(saved.format || 'png').toLowerCase();
     if (!/^[a-z0-9]{1,5}$/.test(fmt)) { fmt = 'png'; }
 
-    var url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-    var dl  = document.createElement('a');
-    dl.href = url;
-    dl.download = 'plot.' + fmt;
-    document.body.appendChild(dl);
-    dl.click();
-    document.body.removeChild(dl);
-    setTimeout(function() { URL.revokeObjectURL(url); }, 0);
+    // octet-stream rather than the format's own MIME, so every format
+    // downloads instead of the browser previewing the ones it can render.
+    downloadBlob(bytes, 'plot.' + fmt, 'application/octet-stream');
     return;
   }
 
