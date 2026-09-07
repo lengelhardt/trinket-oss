@@ -1860,9 +1860,22 @@ function renderFileOutputs(entries, read) {
       $a.attr('role', 'button');
       $a.attr('tabindex', '0');
       $a.attr('title', 'Download ' + entry.name);
+      // The .catch is not belt-and-braces: on the worker path `read` is
+      // client.readFile(), whose promise takes no reject but is created around
+      // a w.postMessage() call -- and a throw from postMessage inside the
+      // Promise constructor becomes a rejection. Without this, a click on a
+      // dead worker produces an unhandled rejection in the student's console
+      // and no explanation. The main-thread reader cannot reach here: it is
+      // try/caught and answers null. Raised in the review of #253.
+      //
+      // Reported the way this file already reports a failed Save, rather than
+      // swallowed: the click was the student's, so silence would read as the
+      // link being broken.
       var save = function() {
         Promise.resolve(read(entry.name)).then(function(bytes) {
           downloadProducedFile(entry.name, bytes);
+        }).catch(function() {
+          writeOut('[Could not read ' + entry.name + ' back out of this program.]\n');
         });
       };
       $a.on('click', save);

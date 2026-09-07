@@ -425,8 +425,8 @@ describe('file outputs', () => {
   // the caller waits forever. Raised in the review of #253.
   //
   // Note what this means about the test above: it passes on the `if (!worker)`
-  // guard alone and would keep passing with the bug present. It was not cover
-  // for this at all, despite its original name saying "rather than hanging".
+  // guard alone and would keep passing with the bug present. It never covered
+  // this case at all, despite its original name saying "rather than hanging".
   it('resolves a listing already in flight when the worker is discarded', async () => {
     const { client } = await bootedClient();
     const p = client.listFiles();
