@@ -2654,6 +2654,33 @@ function handleWorkerFigure(msg) {
     return;
   }
 
+  // The toolbar Save button, rendered in the worker and delivered here (#252).
+  // The worker cannot do the delivery itself: Pyodide's patched handle_save
+  // builds an <a download> from `document`, which in a worker is the inert stub
+  // installed by pyodide-worker.js, so the anchor goes nowhere and the button
+  // is a silent no-op. The worker now swallows the save message, renders the
+  // bytes, and sends them across for this side to download -- same <a download>
+  // shape embed.js already uses, and no form, so the embed CSP contract holds.
+  if (msg.kind === 'save') {
+    var saved;
+    try { saved = JSON.parse(msg.data); } catch (e) { return; }
+    if (!saved || !saved.b64) return;
+    var dl = document.createElement('a');
+    // octet-stream, not the format's own MIME: a Save button should download
+    // every format, not preview the ones the browser happens to render.
+    dl.href = 'data:application/octet-stream;base64,' + saved.b64;
+    dl.download = 'plot.' + (saved.format || 'png');
+    dl.click();
+    return;
+  }
+
+  // A save that raised in the worker. Say so rather than failing the way this
+  // button used to -- silently.
+  if (msg.kind === 'save-error') {
+    writeOut('[Could not save the figure: ' + msg.data + ']\n');
+    return;
+  }
+
   if (msg.kind === 'json' || msg.kind === 'text') {
     var entry = mplFigures[msg.figureId];
     if (entry && typeof entry.socket.onmessage === 'function') {
