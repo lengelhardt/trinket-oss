@@ -644,6 +644,39 @@
           return;
         }
 
+        // Files the program wrote, for the file-outputs strip (#253). Raw
+        // entries only: the page owns the decision about what counts as a
+        // student's file, so the two runtimes cannot drift apart on it.
+        if (msg.type === 'fs-list') {
+          var entries = [];
+          try {
+            var names = pyodide ? pyodide.FS.readdir('.') : [];
+            for (var fi = 0; fi < names.length; fi++) {
+              var fname = names[fi];
+              if (fname === '.' || fname === '..') continue;
+              try {
+                var fst = pyodide.FS.stat(fname);
+                entries.push({ name: fname, size: fst.size, isDir: pyodide.FS.isDir(fst.mode) });
+              } catch (e) {}
+            }
+          } catch (e) {
+            entries = [];             // a listing failure must never break a run
+          }
+          post({ type: 'fs-list-result', id: msg.id, entries: entries });
+          return;
+        }
+
+        // One file's bytes, on demand. Deliberately not shipped with the
+        // listing: a run can leave several megabytes behind and most of it is
+        // never downloaded, so the copy across postMessage is paid for only by
+        // the click that wants it.
+        if (msg.type === 'fs-read') {
+          var bytes = null;
+          try { bytes = pyodide ? pyodide.FS.readFile(String(msg.name)) : null; } catch (e) { bytes = null; }
+          post({ type: 'fs-read-result', id: msg.id, name: msg.name, bytes: bytes });
+          return;
+        }
+
         if (msg.type === 'mpl-event') {
           if (pyodide) {
             pyodide.globals.set('__mpl_figid__', msg.figureId);

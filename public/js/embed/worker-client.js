@@ -29,6 +29,33 @@
       if (run) run.resolve();
     }
 
+    // Terminating the worker orphans every resolver still in `pending`: no
+    // reply is coming, and only a reply deletes them, so each caller's promise
+    // would never settle. The `if (!worker)` guards in snapshot() / listFiles()
+    // / readFile() cover a request made AFTER the worker is gone; a request
+    // already in flight when it dies needs this. Raised in the review of #253,
+    // and it was already true of snapshot() before this branch added two more
+    // callers to the same shape.
+    //
+    // NOT folded into settle(): that also runs on ordinary run completion,
+    // where an in-flight snapshot or listing is perfectly valid and must be
+    // left alone.
+    //
+    // Each caller gets its own empty answer rather than a rejection. Every call
+    // site already treats "nothing" as a normal outcome, and rejecting here
+    // would surface as an unhandled rejection from a run that merely stopped.
+    function flushPending() {
+      var ids = Object.keys(pending);
+      for (var i = 0; i < ids.length; i++) {
+        var id = ids[i];
+        var resolve = pending[id];
+        delete pending[id];
+        // readFile answers with bytes-or-null; snapshot and listFiles answer
+        // with arrays. Keyed off the id prefix each one mints.
+        try { resolve(id.indexOf('fsrd-') === 0 ? null : []); } catch (e) {}
+      }
+    }
+
     function onMessage(e) {
       var msg = (e && e.data) || {};
 
@@ -103,6 +130,24 @@
         var parsed = [];
         try { parsed = msg.json ? JSON.parse(msg.json) : []; } catch (e) { parsed = []; }
         done(parsed);
+        return;
+      }
+
+      // Same request/response shape, for the files the program wrote (#253).
+      // Also asked for after a run, when the worker is idle.
+      if (msg.type === 'fs-list-result') {
+        var listDone = pending[msg.id];
+        if (!listDone) return;
+        delete pending[msg.id];
+        listDone(msg.entries || []);
+        return;
+      }
+
+      if (msg.type === 'fs-read-result') {
+        var readDone = pending[msg.id];
+        if (!readDone) return;
+        delete pending[msg.id];
+        readDone(msg.bytes || null);
         return;
       }
 
@@ -192,6 +237,7 @@
       // cancellation can never reach.
       stop: function() {
         if (worker) { worker.terminate(); worker = null; }
+        flushPending();
         settle();
       },
 
@@ -212,6 +258,7 @@
       discardWorker: function() {
         var had = !!worker;
         if (worker) { worker.terminate(); worker = null; }
+        flushPending();
         settle();
         return had;
       },
@@ -247,6 +294,30 @@
         });
       },
 
+      // Directory listing for the file-outputs strip. Same guard as snapshot():
+      // a stop terminates the worker, so there is no filesystem left to read and
+      // no reply is ever coming — resolve empty rather than hang the caller.
+      listFiles: function() {
+        if (!worker) return Promise.resolve([]);
+        var w = worker;
+        var id = 'fsls-' + (++seq);
+        return new Promise(function(resolve) {
+          pending[id] = resolve;
+          w.postMessage({ type: 'fs-list', id: id });
+        });
+      },
+
+      // One file's bytes, on the click that wants them.
+      readFile: function(name) {
+        if (!worker) return Promise.resolve(null);
+        var w = worker;
+        var id = 'fsrd-' + (++seq);
+        return new Promise(function(resolve) {
+          pending[id] = resolve;
+          w.postMessage({ type: 'fs-read', id: id, name: String(name) });
+        });
+      },
+
       // Toolbar clicks and mouse events, back to the figure's manager.
       sendMplEvent: function(figureId, content) {
         if (worker) {
@@ -272,6 +343,7 @@
 
       dispose: function() {
         if (worker) { worker.terminate(); worker = null; }
+        flushPending();
         current = null;
       }
     };

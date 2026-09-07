@@ -883,6 +883,10 @@ function setCancelRequested(v) {
 var rerunQueued = false;      // a Run was clicked mid-run; re-run once it stops
 var runningIsVpython = false; // the in-flight run is a MAIN-THREAD VPython program (cancellable)
 var runningIsWorkerVPython = false; // ...and the worker-path equivalent (restartable by terminate)
+// Which runtime the run that is finishing actually used. The file-outputs strip
+// (#253) has to read the filesystem the program wrote to, and those are two
+// different filesystems: the page's Pyodide, or the worker's.
+var lastRunUsedWorker = false;
 var vpythonBaselineCaptured = false; // folded vpython star-imports into the explorer baseline once
 
 // Wrap the global rate() so it rejects when cancellation is requested. Must run
@@ -1659,6 +1663,240 @@ var EXPAND_HELPER = [
 // and we skip the per-run snapshot and the tab wiring entirely.
 function variableExplorerEnabled() {
   return !!(window.trinket && window.trinket.config && window.trinket.config.variableExplorer);
+}
+
+// ---------------------------------------------------------------------------
+// Files the program wrote (#253, features.fileOutputs)
+//
+// plt.savefig('plot.png'), open('results.txt','w'), df.to_csv(...) and
+// np.save(...) all succeed today and write a correct file into Pyodide's
+// in-memory filesystem. Nothing ever read one back out, so the file was
+// unreachable and gone on reload. This gives that filesystem an exit: after a
+// run, list what is in the working directory and offer it.
+//
+// Deliberately a listing rather than a diff against a pre-run snapshot. Pyodide's
+// FS persists for the life of the session, so a file written by an earlier run
+// still exists and is still worth offering; a strict diff would make the
+// download vanish the moment the student pressed Run again.
+
+function fileOutputsEnabled() {
+  return !!(window.trinket && window.trinket.config && window.trinket.config.fileOutputs);
+}
+
+// Files the runtime itself puts in the working directory. Offering these would
+// be noise at best and confusing at worst — a student did not write console.py.
+var FILE_OUTPUT_OWNED = {
+  'console.py': true,
+  'main.py': true,
+  '_trinket_display.py': true,
+  '_trinket_async_transform.py': true
+};
+
+// Per-file ceiling. The worker path structured-clones the bytes across
+// postMessage, and a runaway np.save() should not wedge the page; over this the
+// file is listed but not offered.
+var FILE_OUTPUT_MAX_BYTES = 10 * 1024 * 1024;
+
+// Names the student can see and edit as tabs are already downloadable through
+// the toolbar, and syncFilesToFS writes them into this same directory. Listing
+// them here would offer the same file by two routes.
+function fileOutputEditorNames() {
+  var names = {};
+  try {
+    var files = editor && editor.getAllFiles ? editor.getAllFiles() : null;
+    for (var k in files) {
+      if (Object.prototype.hasOwnProperty.call(files, k)) names[k] = true;
+    }
+  } catch (e) {}
+  return names;
+}
+
+function fileOutputIsOffered(name, editorNames) {
+  if (!name || name.charAt(0) === '.') return false;   // .matplotlib and friends
+  if (FILE_OUTPUT_OWNED[name]) return false;
+  if (editorNames[name]) return false;
+  return true;
+}
+
+// The one filter, applied to raw directory entries from either runtime. The
+// worker deliberately returns everything it sees and this decides what is
+// offered, so the two runtimes cannot drift apart on what counts as a student's
+// file — the divergence this codebase already has too much of.
+function filterProducedEntries(raw) {
+  var editorNames = fileOutputEditorNames(), out = [];
+  for (var i = 0; i < (raw || []).length; i++) {
+    var e = raw[i];
+    if (!e || e.isDir) continue;
+    if (!fileOutputIsOffered(e.name, editorNames)) continue;
+    out.push({ name: e.name, size: e.size });
+  }
+  out.sort(function(a, b) { return a.name < b.name ? -1 : (a.name > b.name ? 1 : 0); });
+  return out;
+}
+
+// Raw directory entries from the page's own Pyodide. The 'fs-list' handler in
+// pyodide-worker.js is the same three lines against the worker's filesystem.
+function readDirEntries(fs) {
+  var entries = [], names;
+  try { names = fs.readdir('.'); } catch (e) { return entries; }
+  for (var i = 0; i < names.length; i++) {
+    var name = names[i];
+    if (name === '.' || name === '..') continue;
+    try {
+      var st = fs.stat(name);
+      entries.push({ name: name, size: st.size, isDir: fs.isDir(st.mode) });
+    } catch (e) {}
+  }
+  return entries;
+}
+
+function listProducedFilesMain() {
+  if (!pyodide || !pyodideReady) return [];
+  return filterProducedEntries(readDirEntries(pyodide.FS));
+}
+
+function readProducedFileMain(name) {
+  try { return pyodide.FS.readFile(name); } catch (e) { return null; }
+}
+
+// Extension -> MIME, so the browser and the OS treat the saved file sensibly.
+// Anything unlisted downloads as a binary blob, which is correct rather than
+// merely safe: a wrong text/* would let a browser render it inline instead.
+var FILE_OUTPUT_MIME = {
+  png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+  svg: 'image/svg+xml', webp: 'image/webp', tif: 'image/tiff', tiff: 'image/tiff',
+  pdf: 'application/pdf', eps: 'application/postscript', ps: 'application/postscript',
+  csv: 'text/csv', txt: 'text/plain', md: 'text/markdown', json: 'application/json',
+  html: 'text/html', xml: 'application/xml', py: 'text/x-python'
+};
+
+function fileOutputMime(name) {
+  var m = /\.([A-Za-z0-9]+)$/.exec(name || '');
+  return (m && FILE_OUTPUT_MIME[m[1].toLowerCase()]) || 'application/octet-stream';
+}
+
+function fileOutputSizeLabel(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024 * 1024) return Math.round(bytes / 1024) + ' KB';
+  return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+// The one Blob download path in this file. Blob + <a download>, never a form
+// and never an iframe: the embed CSP carries `form-action 'none'` and
+// test/lib/api/embed-csp-contract.test.js fails the build if anything under
+// public/js/embed/ creates or submits one (#224).
+//
+// Shared by the two callers that used to have a copy each -- the files a
+// program wrote (#253, below) and the matplotlib toolbar's Save (#252, in
+// handleWorkerFigure). Their copies had drifted apart on both points that
+// matter here, and the stricter answer is right in both cases:
+//
+//   * Errors. The save path had no try/catch, so a throw from any of the
+//     DOM/Blob calls killed the run that produced the file. Raised in the
+//     review of #256 and true until now.
+//   * Revoke timing. The save path revoked on a 0 ms timeout. Safari fetches
+//     the blob AFTER click() returns, so revoking that eagerly can cancel the
+//     download it just started -- a bug that only shows up on one browser, and
+//     the reason the generous delay below is deliberate rather than lazy.
+//
+// embed.js:795 keeps its own copy on purpose: it is a separate bundle, loaded
+// on pages that never load pyodide.js, so sharing would mean introducing a
+// shared module for one function.
+function downloadBlob(bytes, filename, mime) {
+  if (!bytes) return;
+  var url = null, link = null;
+  try {
+    url = URL.createObjectURL(new Blob([bytes], { type: mime || 'application/octet-stream' }));
+    link = document.createElement('a');
+    link.href = url;
+    link.download = filename;
+    document.body.appendChild(link);
+    link.click();
+  } catch (e) {
+    // Deliberately swallowed: a failed save must never break the run.
+  } finally {
+    if (link && link.parentNode) link.parentNode.removeChild(link);
+    if (url) window.setTimeout(function() { URL.revokeObjectURL(url); }, 30000);
+  }
+}
+
+function downloadProducedFile(name, bytes) {
+  downloadBlob(bytes, name, fileOutputMime(name));
+}
+
+// `read` is the runtime's byte reader: synchronous on the main thread, a
+// promise on the worker. Normalised here so the rendering is written once.
+function renderFileOutputs(entries, read) {
+  var $wrap = $('#file-outputs');
+  if (!$wrap.length) return;
+  $wrap.empty();
+
+  if (!entries || !entries.length) {
+    $wrap.addClass('hide');
+    $('#console-wrap').removeClass('has-file-outputs');
+    return;
+  }
+
+  $wrap.append($('<span class="file-outputs-label"></span>').text('Your program created:'));
+
+  entries.forEach(function(entry) {
+    var tooBig = entry.size > FILE_OUTPUT_MAX_BYTES;
+    // Stays an <a> either way so the stylesheet's `a.file-output` rules apply,
+    // but role/tabindex are added ONLY when there is something to activate. A
+    // too-large entry carried both, so a screen reader announced a button and
+    // the keyboard stopped on it, with no handler behind either. Raised in the
+    // review of #253.
+    var $a = $('<a class="file-output"></a>');
+    $a.text(entry.name);
+    $a.append($('<span class="file-output-size"></span>').text(
+      ' (' + fileOutputSizeLabel(entry.size) + (tooBig ? ', too large to download' : '') + ')'));
+
+    if (tooBig) {
+      $a.attr('aria-disabled', 'true');
+      $a.attr('title', 'This file is over ' + fileOutputSizeLabel(FILE_OUTPUT_MAX_BYTES) +
+        ' and cannot be downloaded from the browser.');
+      $a.css({ color: '#7b8b98', cursor: 'default' });
+    } else {
+      $a.attr('role', 'button');
+      $a.attr('tabindex', '0');
+      $a.attr('title', 'Download ' + entry.name);
+      // The .catch is not belt-and-braces: on the worker path `read` is
+      // client.readFile(), whose promise takes no reject but is created around
+      // a w.postMessage() call -- and a throw from postMessage inside the
+      // Promise constructor becomes a rejection. Without this, a click on a
+      // dead worker produces an unhandled rejection in the student's console
+      // and no explanation. The main-thread reader cannot reach here: it is
+      // try/caught and answers null. Raised in the review of #253.
+      //
+      // Reported the way this file already reports a failed Save, rather than
+      // swallowed: the click was the student's, so silence would read as the
+      // link being broken.
+      var save = function() {
+        Promise.resolve(read(entry.name)).then(function(bytes) {
+          downloadProducedFile(entry.name, bytes);
+        }).catch(function() {
+          writeOut('[Could not read ' + entry.name + ' back out of this program.]\n');
+        });
+      };
+      $a.on('click', save);
+      $a.on('keydown', function(ev) {
+        if (ev.which === 13 || ev.which === 32) { ev.preventDefault(); save(); }
+      });
+    }
+    $wrap.append($a);
+  });
+
+  $wrap.removeClass('hide');
+  $('#console-wrap').addClass('has-file-outputs');
+}
+
+// Called from finishRun() for the main thread, and from the worker completion
+// path once the worker has answered. Never allowed to break run completion.
+function refreshFileOutputsMain() {
+  if (!fileOutputsEnabled()) return;
+  try {
+    renderFileOutputs(listProducedFilesMain(), readProducedFileMain);
+  } catch (e) {}
 }
 
 function snapshotVariables() {
@@ -3044,14 +3282,9 @@ function handleWorkerFigure(msg) {
     var fmt = String(saved.format || 'png').toLowerCase();
     if (!/^[a-z0-9]{1,5}$/.test(fmt)) { fmt = 'png'; }
 
-    var url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
-    var dl  = document.createElement('a');
-    dl.href = url;
-    dl.download = 'plot.' + fmt;
-    document.body.appendChild(dl);
-    dl.click();
-    document.body.removeChild(dl);
-    setTimeout(function() { URL.revokeObjectURL(url); }, 0);
+    // octet-stream rather than the format's own MIME, so every format
+    // downloads instead of the browser previewing the ones it can render.
+    downloadBlob(bytes, 'plot.' + fmt, 'application/octet-stream');
     return;
   }
 
@@ -3164,6 +3397,7 @@ function runInWorker(program, files, serialized, decision) {
   // transport exists are dropped in the worker, by design (createSceneChannel).
   if (decision && decision.vpython) { startVPythonPacer(); }
 
+  lastRunUsedWorker = true;
   return workerClient.run(program, files, {
     graphicWidth: graphicWidth,
     vpython: !!(decision && decision.vpython),
@@ -3190,6 +3424,19 @@ function runInWorker(program, files, serialized, decision) {
     if (variableExplorerEnabled()) {
       workerClient.snapshot().then(function(vars) {
         try { renderVariables(vars); } catch (e) {}
+      });
+    }
+
+    // Same shape for the files the program wrote: the page's own Pyodide never
+    // ran this program, so its filesystem is the wrong one to list. Ask the
+    // worker, and read bytes back across the same channel on demand rather than
+    // shipping every file the moment the run ends.
+    if (fileOutputsEnabled()) {
+      workerClient.listFiles().then(function(entries) {
+        try {
+          renderFileOutputs(filterProducedEntries(entries),
+            function(name) { return workerClient.readFile(name); });
+        } catch (e) {}
       });
     }
   });
@@ -3225,6 +3472,11 @@ function finishRun(serializedCode, err) {
   if (!rerunQueued && window.trinketPlotpolish) {
     try { trinketPlotpolish.afterRun(window.__trinketRuntime); } catch (e) {}
   }
+
+  // Offer whatever the program wrote into the filesystem (#253). Only for
+  // main-thread runs: a worker run wrote into the worker's filesystem, and the
+  // worker path below asks for that listing itself once the worker answers.
+  if (!lastRunUsedWorker) refreshFileOutputsMain();
 
   // A Run was clicked while the previous (VPython) run was being cancelled;
   // now that it has stopped, start the fresh run.
@@ -3278,6 +3530,7 @@ function runCode() {
 
 function startRun() {
   setCancelRequested(false);
+  lastRunUsedWorker = false;
   // Offer Stop while the program runs. Cancellation only lands at a yield point
   // (rate()/time.sleep()); stopCode() tells the student when there isn't one.
   $('.stop-it').removeClass('hide');

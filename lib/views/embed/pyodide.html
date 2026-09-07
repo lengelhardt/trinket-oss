@@ -250,6 +250,53 @@
     cursor: pointer;
   }
   #embed_content_python #debug-start-alt:hover { color: #14435f; }
+  /* Files the program wrote (#253). A strip pinned to the bottom of the output
+     pane, so it reads as a result of the run rather than as chrome. Hidden
+     entirely when the run produced nothing, which is the common case. */
+  #embed_content_python #file-outputs {
+    border-top: 1px solid #d7e0e8;
+    background: #f6f8fa;
+    padding: 5px 8px;
+    font-size: 0.85rem;
+    line-height: 1.5;
+    max-height: 5.5rem;
+    overflow-y: auto;
+  }
+  #embed_content_python #file-outputs .file-outputs-label {
+    color: #4b5c6b;
+    margin-right: 6px;
+    -webkit-user-select: none; -moz-user-select: none; user-select: none;
+  }
+  #embed_content_python #file-outputs a.file-output {
+    display: inline-block;
+    margin: 0 8px 0 0;
+    color: #2b6c9e;
+    cursor: pointer;
+    text-decoration: none;
+    border-bottom: 1px solid transparent;
+  }
+  #embed_content_python #file-outputs a.file-output:hover,
+  #embed_content_python #file-outputs a.file-output:focus {
+    color: #14435f;
+    border-bottom-color: #14435f;
+  }
+  #embed_content_python #file-outputs .file-output-size { color: #7b8b98; }
+  /* The strip has to sit INSIDE the output pane, not below it. #console-wrap is
+     height: 100% and height-managed by the dragbar, and #console-output fills
+     it, so an appended child renders past the bottom edge and is never seen.
+     Switch to a column layout only while there is something to show, so a run
+     that produced nothing leaves the existing layout untouched. The absolutely
+     positioned #reset-output / #debug-start-alt are unaffected either way. */
+  #embed_content_python #console-wrap.has-file-outputs {
+    display: flex;
+    flex-direction: column;
+  }
+  #embed_content_python #console-wrap.has-file-outputs #console-output {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  #embed_content_python #console-wrap.has-file-outputs #file-outputs { flex: 0 0 auto; }
   #embed_content_python #variables-toolbar .debug-start {
     border: 1px solid #c6d8e4;
     border-radius: 3px;
@@ -433,6 +480,12 @@
            it where they already are after clicking Run. Switches to Variables
            and starts recording, so both routes end in the same place. #}
         <a id="debug-start-alt" role="button" tabindex="0" title="Step through this program line by line"><i class="fa fa-step-forward"></i></a>
+        {% endif %}
+        {% if config.features.fileOutputs %}
+        {# Files the program wrote into Pyodide's filesystem. Without this the
+           file is written correctly and is simply unreachable (#253). Populated
+           by pyodide.js after each run; stays hidden when there is nothing. #}
+        <div id="file-outputs" class="hide" aria-live="polite" aria-label="Files your program created"></div>
         {% endif %}
       </div>
     </div>

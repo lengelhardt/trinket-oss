@@ -352,6 +352,17 @@ describe('variable snapshot over the channel', () => {
     await expect(p).resolves.toEqual([]);
   });
 
+  // Same defect as the file-output requests, and it predates them: snapshot()
+  // has always registered its resolver in `pending` and relied on a reply to
+  // clear it. flushPending() fixes all three at once, so pin the one that was
+  // already shipping.
+  it('resolves a snapshot already in flight when the worker is stopped', async () => {
+    const { client } = await bootedClient();
+    const p = client.snapshot();
+    client.stop();
+    await expect(p).resolves.toEqual([]);
+  });
+
   it('resolves to an empty array if the worker is gone (stopped)', async () => {
     // Terminating discards the namespace, so a snapshot request after a stop can
     // never be answered. It must not hang the caller.
@@ -361,5 +372,82 @@ describe('variable snapshot over the channel', () => {
     await tick();
     client.stop();
     await expect(client.snapshot()).resolves.toEqual([]);
+  });
+});
+
+// #253: the files a program wrote. Same request/response shape as snapshot(),
+// and the same guarantee — a terminated worker resolves rather than hangs.
+describe('file outputs', () => {
+  it('asks the worker for a listing and resolves with its entries', async () => {
+    const { client, made } = await bootedClient();
+    const p = client.listFiles();
+    const sent = made[0].posted.filter(m => m.type === 'fs-list');
+    expect(sent.length).toBe(1);
+    made[0].onmessage({ data: {
+      type: 'fs-list-result', id: sent[0].id,
+      entries: [{ name: 'plot.png', size: 19648, isDir: false }]
+    } });
+    await expect(p).resolves.toEqual([{ name: 'plot.png', size: 19648, isDir: false }]);
+  });
+
+  it('reads one file by name and resolves with its bytes', async () => {
+    const { client, made } = await bootedClient();
+    const p = client.readFile('plot.png');
+    const sent = made[0].posted.filter(m => m.type === 'fs-read');
+    expect(sent.length).toBe(1);
+    expect(sent[0].name).toBe('plot.png');
+    made[0].onmessage({ data: {
+      type: 'fs-read-result', id: sent[0].id, name: 'plot.png',
+      bytes: new Uint8Array([137, 80, 78, 71]),   // the PNG magic number
+    } });
+
+    // By value, not by identity. A real reply crosses postMessage, so the bytes
+    // are structured-cloned and can never be the same object the worker sent --
+    // `toBe` pinned a property of this mock that production cannot have, and
+    // would have failed on a harmless change like re-wrapping the reply in a
+    // fresh Uint8Array. Raised in the review of #253.
+    const got = await p;
+    expect(got).toBeInstanceOf(Uint8Array);
+    expect(Array.from(got)).toEqual([137, 80, 78, 71]);
+  });
+
+  it('resolves empty when called AFTER the worker is gone (the pre-call guard)', async () => {
+    const { client } = await bootedClient();
+    client.discardWorker();
+    await expect(client.listFiles()).resolves.toEqual([]);
+    await expect(client.readFile('plot.png')).resolves.toBe(null);
+  });
+
+  // The half the guard cannot reach, and the reason flushPending() exists: the
+  // request is posted while the worker is alive, so the resolver is already in
+  // `pending` when it is terminated. Only a reply deletes from `pending`, and
+  // no reply is coming -- so without the flush these promises never settle and
+  // the caller waits forever. Raised in the review of #253.
+  //
+  // Note what this means about the test above: it passes on the `if (!worker)`
+  // guard alone and would keep passing with the bug present. It never covered
+  // this case at all, despite its original name saying "rather than hanging".
+  it('resolves a listing already in flight when the worker is discarded', async () => {
+    const { client } = await bootedClient();
+    const p = client.listFiles();
+    client.discardWorker();
+    await expect(p).resolves.toEqual([]);
+  });
+
+  it('resolves a read already in flight when the worker is stopped', async () => {
+    const { client } = await bootedClient();
+    const p = client.readFile('plot.png');
+    client.stop();
+    await expect(p).resolves.toBe(null);
+  });
+
+  it('ignores a reply whose id nothing is waiting on', async () => {
+    const { client, made } = await bootedClient();
+    const p = client.listFiles();
+    const id = made[0].posted.filter(m => m.type === 'fs-list')[0].id;
+    // A stale reply from a worker we already replaced must not settle this one.
+    made[0].onmessage({ data: { type: 'fs-list-result', id: 'fsls-stale', entries: [{ name: 'x' }] } });
+    made[0].onmessage({ data: { type: 'fs-list-result', id, entries: [] } });
+    await expect(p).resolves.toEqual([]);
   });
 });
