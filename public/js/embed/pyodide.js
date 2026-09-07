@@ -343,6 +343,19 @@ window.__trinket_console_input = function(prompt) {
 // ---------------------------------------------------------------------------
 var pyodideConsole = null;   // the PyodideConsole instance, created on first use
 var replActive     = false;  // a REPL prompt is armed or evaluating
+// True only while a MAIN-THREAD REPL statement is actually executing. Distinct
+// from replActive, which stays true for the whole console session: gating on
+// that would disable the plot-style panel's live preview for as long as a
+// student leaves the prompt open, which is most of the lesson.
+//
+// The window that matters is the await inside the Prompt callback below.
+// PyodideConsole evaluates asynchronously and a REPL turn deliberately never
+// sets `running` (see the note above), so without this flag every other "is
+// Python busy?" test reads false while a statement is mid-flight, and the panel
+// would re-enter this thread's Pyodide from a JS callback inside an awaited
+// Python frame. The worker-backed REPL needs no equivalent: its interpreter is
+// off-thread, and a worker run gives the panel no backend at all.
+var replEvaluating = false;
 
 // Build the PyodideConsole. Its globals are the SAME namespace the Run button
 // uses, so a REPL session can inspect what a program just defined — the main
@@ -503,9 +516,11 @@ function startReplPrompt() {
 
     var console_ = ensurePyodideConsole();
     var result;
+    replEvaluating = true;
     try {
       result = console_.push(input);
     } catch (e) {
+      replEvaluating = false;
       writeReplError(e);
       startReplPrompt();
       return;
@@ -522,7 +537,9 @@ function startReplPrompt() {
       .catch(function(err) {
         writeReplError(err);
       })
-      .then(function() { startReplPrompt(); });
+      // Runs on both outcomes -- the .catch above absorbs the rejection -- so
+      // the flag cannot be stranded true by a failed statement.
+      .then(function() { replEvaluating = false; startReplPrompt(); });
 
   }, function(input) {
     // Continuation callback. jq-console's contract (see python.js's Skulpt REPL,
@@ -1099,6 +1116,11 @@ function setupGlowScene() {
   var graphic = document.getElementById('graphic');
   var cont = document.createElement('div');
   cont.id = 'glowscript';
+  // Load-bearing: the plot-style adapter's hasFigure() excludes VPython
+  // scenes with closest('.glowscript'), matching this CLASS rather than
+  // either container's id -- there are two of them and an id check caught
+  // only one (#251). A new scene container must carry this class or the
+  // matplotlib pill will mount over it.
   cont.className = 'glowscript';
   graphic.appendChild(cont);
 
@@ -2369,10 +2391,22 @@ function runStepThrough() {
   $('#debug-launch').addClass('hide');
   $('#debug-recording').removeClass('hide');
 
-  function recordingDone() {
+  // `ran` says whether the recorder actually executed the program. The bails
+  // above it (debugCancelled, a normal run got in first, VPython, console) resolve
+  // the chain with null and still land in the .then below, so an unconditional
+  // hook fired on paths where nothing ran at all -- and on a worker-runtime
+  // trinket that flipped the panel from "no backend" onto THIS thread's
+  // Pyodide, which never ran the program and holds no figure.
+  function recordingDone(ran) {
     debugRecording = false;
     $('#debug-recording').addClass('hide');
     if (!debugRec) $('#debug-launch').removeClass('hide');
+    // Step-through does not go through finishRun(), but a real recording
+    // re-runs the program on the page's Pyodide and can leave a different
+    // figure behind. Always 'main': the recorder never uses the worker.
+    if (ran && window.trinketPlotpolish) {
+      try { trinketPlotpolish.afterRun('main'); } catch (e) {}
+    }
   }
 
   ensurePyodide().then(function() {
@@ -2433,13 +2467,13 @@ function runStepThrough() {
       });
     });
   }).then(function(rec) {
-    recordingDone();
+    recordingDone(!!rec && !debugCancelled);
     if (rec && !debugCancelled) {
       initConsoleOutput();
       enterReplay(rec);
     }
   }).catch(function(err) {
-    recordingDone();
+    recordingDone(false);
     $('#debug-note').text('recording failed');
     setTimeout(function() { $('#debug-note').text(''); }, 4000);
   });
@@ -2987,6 +3021,11 @@ function ensureVPythonFrontend() {
     if (!holder) {
       holder = document.createElement('div');
       holder.id = 'vpython-scene';
+      // Load-bearing: the plot-style adapter's hasFigure() excludes VPython
+      // scenes with closest('.glowscript'), matching this CLASS rather than
+      // either container's id -- there are two of them and an id check caught
+      // only one (#251). A new scene container must carry this class or the
+      // matplotlib pill will mount over it.
       holder.className = 'glowscript';
       (document.getElementById('graphic') || document.body).appendChild(holder);
     }
@@ -3136,17 +3175,89 @@ function handleWorkerFigure(msg) {
 
     var socket = makeMplSocket(msg.figureId);
     var fig = new window.mpl.figure(msg.figureId, socket, function(figure, format) {
-      // The toolbar's save button: matplotlib hands back a download URL.
-      var link = document.createElement('a');
-      link.href = figure.canvas.toDataURL('image/' + (format || 'png'));
-      link.download = 'plot.' + (format || 'png');
-      link.click();
+      // The toolbar's Save button, for the day this mpl.js calls ondownload
+      // again. Pyodide 0.28.1's patched build does not: its handle_save posts
+      // {type:'save'} over the socket, which is the route the worker now
+      // swallows and answers with savefig bytes. So this callback is dead
+      // against the build we ship today.
+      //
+      // It is kept, and made to agree, because the patch is Pyodide's and not
+      // ours: a future Pyodide that drops it would silently restore this call.
+      // Send the same message the patched build sends, so both routes end at
+      // the same savefig. The alternative -- the canvas grab this used to do --
+      // silently changes what Save means, since toDataURL ignores savefig.dpi,
+      // .transparent and .bbox_inches and returns on-screen pixels at screen
+      // dpi. A student who set dpi=300 for a lab report would get 96.
+      socket.send({ type: 'save', figure_id: msg.figureId, format: format || 'png' });
     }, host);
 
     mplFigures[msg.figureId] = { fig: fig, socket: socket };
     applyMplToolbarIcons(fig);
     if (typeof socket.onopen === 'function') { socket.onopen(); }
 
+    return;
+  }
+
+  // The toolbar Save button, rendered in the worker and delivered here (#252).
+  // The worker cannot do the delivery itself: Pyodide's patched handle_save
+  // builds an <a download> from `document`, which in a worker is the inert stub
+  // installed by pyodide-worker.js, so the anchor goes nowhere and the button
+  // is a silent no-op. The worker now swallows the save message, renders the
+  // bytes, and sends them across for this side to download -- same <a download>
+  // shape embed.js already uses, and no form, so the embed CSP contract holds.
+  if (msg.kind === 'save') {
+    var saved = null;
+    try { saved = JSON.parse(msg.data); } catch (e) { saved = null; }
+    // Do not fail the way this button used to. A reply this side cannot read is
+    // the same experience for the student as the bug being fixed here -- click,
+    // nothing -- so it has to say something rather than return quietly.
+    if (!saved || !saved.b64) {
+      writeOut('[Could not save the figure: the worker sent a reply this page could not read.]\n');
+      return;
+    }
+    // Blob + object URL, not a data: URL -- mirroring the download at
+    // embed.js:795. raw and tif run to ~1.2 MB, so a base64 data: URL would be
+    // ~1.6 MB of URL, which browsers treat inconsistently, and the embed CSP
+    // permits `data:` for img-src only. An object URL has no such length, and
+    // the anchor goes into the DOM before the click because a detached one is
+    // not reliable everywhere either.
+    var bytes;
+    try {
+      var raw = atob(saved.b64);
+      bytes = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) { bytes[i] = raw.charCodeAt(i); }
+    } catch (e) {
+      writeOut('[Could not save the figure: the image data did not decode.]\n');
+      return;
+    }
+
+    // octet-stream, not the format's own MIME: a Save button should download
+    // every format, not preview the ones the browser happens to render.
+    // Constrain the extension rather than trusting the reply. MPL_SETUP and the
+    // student's own program are both run with no `globals` option, so they share
+    // pyodide.globals -- which means student Python can call _trinket_mpl_send
+    // itself and choose this string. Nothing dangerous follows from that (the
+    // file lands on their own machine), but `download` should not take an
+    // arbitrary value, and every format the toolbar offers is four characters
+    // of lowercase alphanumerics or fewer.
+    var fmt = String(saved.format || 'png').toLowerCase();
+    if (!/^[a-z0-9]{1,5}$/.test(fmt)) { fmt = 'png'; }
+
+    var url = URL.createObjectURL(new Blob([bytes], { type: 'application/octet-stream' }));
+    var dl  = document.createElement('a');
+    dl.href = url;
+    dl.download = 'plot.' + fmt;
+    document.body.appendChild(dl);
+    dl.click();
+    document.body.removeChild(dl);
+    setTimeout(function() { URL.revokeObjectURL(url); }, 0);
+    return;
+  }
+
+  // A save that raised in the worker. Say so rather than failing the way this
+  // button used to -- silently.
+  if (msg.kind === 'save-error') {
+    writeOut('[Could not save the figure: ' + msg.data + ']\n');
     return;
   }
 
@@ -3319,6 +3430,13 @@ function finishRun(serializedCode, err) {
   // snapshot failure break run completion. Skipped when the explorer is off.
   if (variableExplorerEnabled()) {
     try { renderVariables(snapshotVariables()); } catch (e) {}
+  }
+
+  // Refresh the plot-style panel against the figure this run left behind.
+  // Skipped when a rerun is queued: startRun() below runs synchronously and
+  // sets running = true, which the panel's backend would then refuse.
+  if (!rerunQueued && window.trinketPlotpolish) {
+    try { trinketPlotpolish.afterRun(window.__trinketRuntime); } catch (e) {}
   }
 
   // Offer whatever the program wrote into the filesystem (#253). Only for
@@ -3807,7 +3925,34 @@ window.TrinketAPI = {
 
     editor.change(function() {
       api.triggerChange();
+      // Guarded like the afterRun hooks: editor.change is single-owner, so a
+      // throw from the optional plugin would take the change pipeline with it.
+      if (window.trinketPlotpolish) {
+        try { trinketPlotpolish.onEditorChange(); } catch (e) {}
+      }
     });
+
+    // The plot-style panel lives in public/js/plugins/plotpolish-adapter.js.
+    // This file is a closure, so api/editor/pyodide/running are not reachable
+    // from out there; hand over the few it needs. window.trinketPlotpolish is
+    // undefined unless features.plotStyle is on, so this is a no-op when off.
+    // Guarded: this runs inside initialize(), so an exception here would take
+    // out everything after it -- the dragbar below included.
+    if (window.trinketPlotpolish) {
+      try {
+        trinketPlotpolish.init({
+            api        : api
+          , getPyodide : function() { return pyodideReady ? pyodide : null; }
+          , isBusy     : function() {
+              // replEvaluating, not replActive: see its declaration. clearMemory()
+              // uses the same three-way test and then handles the REPL separately
+              // (wasReplActive) -- this is the sibling that guard was missing.
+              return running || debugRecording || replEvaluating
+                  || (workerClient && workerClient.isRunning());
+            }
+        });
+      } catch (e) {}
+    }
 
     if (typeof api.draggable === 'function') {
       api.draggable(function() {});
@@ -3949,6 +4094,15 @@ window.TrinketAPI = {
     $('#output-dragbar').addClass('hide');
     $('#console-wrap').css('height', '100%');
     mplFigures = {};
+
+    // The plot-style panel is anchored to #graphic-wrap, which survives the
+    // empty() above, and its backend points at the namespace clearMainThreadMemory()
+    // has just reset. Tell it to come down: mount() is one-way, so a panel left
+    // here would sit over whatever graphic appears next, still wired to a figure
+    // that no longer exists.
+    if (window.trinketPlotpolish) {
+      try { trinketPlotpolish.onFigureGone(); } catch (e) {}
+    }
 
     if (variableExplorerEnabled()) {
       try { renderVariables([]); } catch (e) {}

@@ -340,7 +340,17 @@
         };
       }
       if (typeof self.alert === 'undefined') {
-        self.alert = function() {};
+        // Not a no-op. matplotlib's download helper calls alert() for the
+        // "cannot determine mimetype" case, and a stub that swallows it makes
+        // an unsupported format indistinguishable from a successful save --
+        // the same silence that made #252 hard to find. The save path above
+        // never reaches this (it swallows the message before handle_json, so
+        // the patched Python handle_save never runs), but anything else in the
+        // wheel that alerts would be mute too. stderr lands in the student's
+        // console via worker-client's onStderr.
+        self.alert = function(text) {
+          post({ type: 'stderr', text: String(text) + '\n' });
+        };
       }
     }
 
@@ -436,6 +446,29 @@
       '    # stderr — which lands in the student\'s console. Our socket already',
       '    # declines binary (supports_binary = False), so the message is moot.',
       "    if _evt.get('type') == 'supports_binary':",
+      '        return',
+      '    # The toolbar Save button (#252). Pyodide patches mpl.js so Save posts',
+      "    # {type:'save'} to Python, and patches Python's handle_save to render",
+      "    # the figure and deliver it with document.createElement('a'). On this",
+      '    # side `document` is the inert stub installed above, so that anchor is',
+      '    # built against nothing and clicked into nothing: the button is a',
+      '    # silent no-op, and there is otherwise no way to export a figure from',
+      '    # a worker run at all. Swallow it before handle_json the same way',
+      '    # supports_binary is swallowed, render here, and hand the bytes to the',
+      '    # page, which has a real document to download them with.',
+      '    #',
+      '    # No explicit dpi: the main thread\'s patched handle_save passes none',
+      '    # either, so this keeps the two runtimes producing the same file. The',
+      '    # dpi question belongs to the export-resolution work, not here.',
+      "    if _evt.get('type') == 'save':",
+      "        _fmt = str(_evt.get('format') or 'png')",
+      '        try:',
+      '            _sbuf = _io.BytesIO()',
+      '            _m.canvas.figure.savefig(_sbuf, format=_fmt)',
+      "            _trinket_mpl_send(figid, 'save', _json.dumps(",
+      "                {'format': _fmt, 'b64': _b64.b64encode(_sbuf.getvalue()).decode()}))",
+      '        except Exception as _err:',
+      "            _trinket_mpl_send(figid, 'save-error', str(_err))",
       '        return',
       '    _m.handle_json(_evt)',
       '    # Upstream webagg has a Tornado event loop that pumps refresh_all();',
