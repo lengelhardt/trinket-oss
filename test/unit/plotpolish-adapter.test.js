@@ -123,6 +123,42 @@ d('plot-style adapter — runtime and teardown', () => {
     expect(panel.features.livePreview).toBe(false);
   });
 
+  // hostRcKeys stopped being advisory in plotpolish v0.3.2: it is threaded into
+  // the GENERATED BLOCK as well as set_style()'s keep list, so this list now
+  // decides whether a re-run keeps the worker's pane-fitting figure.figsize or
+  // lets a style (seaborn-v0_8 is one of the default buttons) throw it away.
+  it('claims the pane-fitting figsize as a host key on a WORKER run', () => {
+    const win = boot();
+    addCanvas(win, null);
+    win.trinketPlotpolish.afterRun('worker');
+    expect(pill(win).hostRcKeys).toEqual(['figure.autolayout', 'figure.figsize']);
+  });
+
+  // The main thread sets autolayout and nothing else (pyodide.js
+  // MATPLOTLIB_SETUP_CODE), so claiming figsize here would be wrong rather than
+  // merely useless: the block would save and restore whatever figsize happened
+  // to be current and defeat a style's own choice for no reason.
+  it('does NOT claim figsize on a main-thread run, where nothing sets it', () => {
+    const win = boot();
+    addCanvas(win, null);
+    win.trinketPlotpolish.afterRun('main');
+    expect(pill(win).hostRcKeys).toEqual(['figure.autolayout']);
+  });
+
+  // The reason the list is set in afterRun() and not mount(): mount() is
+  // one-way, so assigning there would freeze the list at whichever runtime ran
+  // first and silently mis-describe every later run.
+  it('follows the runtime across successive runs, not just the first', () => {
+    const win = boot();
+    addCanvas(win, null);
+    win.trinketPlotpolish.afterRun('main');
+    expect(pill(win).hostRcKeys).toEqual(['figure.autolayout']);
+    win.trinketPlotpolish.afterRun('worker');
+    expect(pill(win).hostRcKeys).toEqual(['figure.autolayout', 'figure.figsize']);
+    win.trinketPlotpolish.afterRun('main');
+    expect(pill(win).hostRcKeys).toEqual(['figure.autolayout']);
+  });
+
   it('Clear memory takes the panel down, and a later figure gets a fresh one', () => {
     const win = boot();
     addCanvas(win, null);
