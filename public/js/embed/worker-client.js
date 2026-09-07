@@ -96,6 +96,24 @@
         return;
       }
 
+      // Same request/response shape, for the files the program wrote (#253).
+      // Also asked for after a run, when the worker is idle.
+      if (msg.type === 'fs-list-result') {
+        var listDone = pending[msg.id];
+        if (!listDone) return;
+        delete pending[msg.id];
+        listDone(msg.entries || []);
+        return;
+      }
+
+      if (msg.type === 'fs-read-result') {
+        var readDone = pending[msg.id];
+        if (!readDone) return;
+        delete pending[msg.id];
+        readDone(msg.bytes || null);
+        return;
+      }
+
       // A boot failure carries no run id — it happened before any run existed.
       // The id check below would drop it, leaving the page waiting on a worker
       // that will never become ready. Report it and settle whatever is waiting.
@@ -234,6 +252,30 @@
         return new Promise(function(resolve) {
           pending[id] = resolve;
           w.postMessage({ type: 'snapshot', id: id });
+        });
+      },
+
+      // Directory listing for the file-outputs strip. Same guard as snapshot():
+      // a stop terminates the worker, so there is no filesystem left to read and
+      // no reply is ever coming — resolve empty rather than hang the caller.
+      listFiles: function() {
+        if (!worker) return Promise.resolve([]);
+        var w = worker;
+        var id = 'fsls-' + (++seq);
+        return new Promise(function(resolve) {
+          pending[id] = resolve;
+          w.postMessage({ type: 'fs-list', id: id });
+        });
+      },
+
+      // One file's bytes, on the click that wants them.
+      readFile: function(name) {
+        if (!worker) return Promise.resolve(null);
+        var w = worker;
+        var id = 'fsrd-' + (++seq);
+        return new Promise(function(resolve) {
+          pending[id] = resolve;
+          w.postMessage({ type: 'fs-read', id: id, name: String(name) });
         });
       },
 
