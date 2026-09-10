@@ -93,6 +93,19 @@
   var placeLast  = null; // last computed left/top, to detect convergence
   var expanded = false;
 
+  // Plot mode. A standing PREFERENCE for this page session -- surviving a
+  // cancelled launch is the specified behaviour, so the deferred-recording
+  // lesson below does not transfer: that was a one-shot INTENT outliving
+  // itself, this is a setting the student turned on.
+  //
+  // No localStorage. There is none anywhere in the panel and this is not the
+  // reason to add the first.
+  var plotsOn = false;
+  // Within plot mode, does one press of the transport move one LINE or one
+  // plot? One timeline either way -- the plot is a function of the step index,
+  // so there is no second clock and no second rate control.
+  var stepByFrame = false;
+
   // ---------------------------------------------------------------------
   // Where the layer lives, and why it is not just `position: fixed`
   // ---------------------------------------------------------------------
@@ -207,7 +220,32 @@
       'justify-content:center;gap:1px;border:0;background:none;cursor:pointer;',
       'color:#0969da;padding:0 10px 0 4px;border-radius:0 999px 999px 0;',
       'flex:0 0 auto;line-height:1;transition:color 90ms ease}',
-    '.tk-dbg.open .tk-dbg-toggle{border-radius:0;border-right:1px solid #e6eaef;padding-right:9px}',
+    // The divider and the open state's padding move to the WRAPPER, so the
+    // plot button sits inside the same column and above the same rule.
+    '.tk-dbg-tcol{display:flex;flex-direction:column;align-items:center;',
+      'justify-content:center;gap:2px;flex:0 0 auto}',
+    '.tk-dbg.open .tk-dbg-tcol{border-right:1px solid #e6eaef;padding-right:9px}',
+    '.tk-dbg.open .tk-dbg-toggle{border-radius:0;padding-right:0}',
+    // Same muted-resting/accent-on-hover convention as every other icon-only
+    // control, and the same !important for the Foundation `button:focus` fight.
+    '.tk-dbg-plotbtn{border:0;background:none;cursor:pointer;padding:0;margin:0;',
+      'line-height:0;color:#8a94a0!important;transition:color 90ms ease}',
+    '.tk-dbg-plotbtn:hover{color:#0969da!important}',
+    '.tk-dbg-plotbtn[aria-pressed="true"]{color:#0969da!important}',
+    '.tk-dbg-plotbtn:focus{color:#0969da!important;outline:none}',
+    // Plot mode is one row taller. 84 + 33.5 (a row) + 3 (the row gap) = 120.5,
+    // rounded to 121, which keeps the body's vertical slack at 14.5 against
+    // the 14 it has today. transitionend already re-runs place()/clampDock()/
+    // placeVars(), so a docked pill repositions itself after the 170ms.
+    '.tk-dbg.open.plots{height:121px}',
+    '.tk-dbg-grp.plots{grid-column:1 / -1;align-items:stretch;width:100%}',
+    '.tk-dbg-grp.plots .tk-dbg-cap{align-self:center}',
+    '.tk-dbg-grp.plots .tk-dbg-box{width:100%;justify-content:space-between;gap:4px}',
+    '.tk-dbg-seg{display:inline-flex;gap:1px}',
+    '.tk-dbg-fcount{font:600 9px/1 -apple-system,BlinkMacSystemFont,"Segoe UI",',
+      'sans-serif;color:#5b6875;letter-spacing:.02em;white-space:nowrap;padding:0 2px}',
+    '.tk-dbg-btn.plotoff{color:#8a94a0!important}',
+    '.tk-dbg-btn.plotoff:hover{color:#3d4753!important}',
     // No fill on hover, here or on any control below. The icon-only convention
     // is a muted resting colour resolving to the accent on hover, with the
     // tooltip carrying the meaning and opacity alone marking disabled -- a
@@ -606,6 +644,16 @@
     +   ' title="Drag the debugger" aria-label="Move the debugger; arrow keys also move it">'
     +   '<span><i></i><i></i><i></i></span><span><i></i><i></i><i></i></span>'
     + '</button>'
+    // The toggle and the plot button are SIBLINGS inside a column wrapper, not
+    // nested -- a button cannot contain a button. The wrapper carries the open
+    // state's divider and padding; `position:relative` stays on the toggle
+    // itself, because the "still stepping" dot is anchored to it.
+    //
+    // This costs no width: the toggle is ~26px of content in an 84px pill, so
+    // the spare room is vertical. Measured in a harness rendering the real
+    // panel, not read off the stylesheet -- place() carries a stale comment
+    // claiming the expanded pill is 412px when the rule says 296.
+    + '<span class="tk-dbg-tcol">'
     + '<button type="button" class="tk-dbg-toggle" data-act="toggle" aria-expanded="false"'
     +   ' title="Step through this program line by line">'
     +   '<span class="w">DEBUG</span>'
@@ -620,6 +668,19 @@
     +     ' title="Still stepping - the output below is the recording, not a live run">'
     +   '</span>'
     + '</button>'
+    // Hidden until the pill is open, as .tk-dbg-body is: on the collapsed pill
+    // there is nothing to turn plots on FOR. aria-pressed already paints the
+    // accent, so "the icon is lit" needs no new rule.
+    + '<button type="button" class="tk-dbg-plotbtn" data-act="plotstoggle"'
+    +   ' aria-pressed="false" hidden'
+    +   ' title="Show plots while you step" aria-label="Show plots while you step">'
+    +   '<svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true">'
+    +     '<g fill="none" stroke="currentColor" stroke-width="1.5"'
+    +       ' stroke-linecap="round" stroke-linejoin="round">'
+    +       '<path d="M2 2v12h12"/><path d="M4.2 10.6l2.7-3.4 2.3 1.9 3.4-4.6"/>'
+    +     '</g></svg>'
+    + '</button>'
+    + '</span>'
     + '<span class="tk-dbg-body">'
     +   '<span data-grp="launch">'
           // Glyph AND phrase inside one button, centred. The words used to sit
@@ -667,6 +728,39 @@
     +         '<span class="tk-dbg-box">'
     +           '<input type="range" class="tk-dbg-slider" data-act="slider" min="0" max="0" value="0"'
     +             ' aria-label="Step position">'
+    +         '</span>'
+    +       '</span>'
+    // A THIRD ROW, spanning both columns, present only in plot mode.
+    //
+    // The grid declares `grid-template-columns:auto auto` and NO
+    // grid-template-rows, so this needs no grid change at all: it lands in an
+    // implicit auto row. Measured in a harness rendering the real panel --
+    // grid-template-rows goes `33.5px 33.5px` -> `33.5px 33.5px 33.5px`, the
+    // grid goes 70 -> 106.5, and only the pill's fixed height has to be told
+    // to grow. Nothing clips; the pill is overflow:visible and .tk-dbg-body's
+    // overflow:hidden bites horizontally, not vertically.
+    //
+    // Spanning both columns rather than taking two cells is deliberate: it
+    // reads as a mode strip, which is what it is.
+    //
+    // The stride control ("every Nth plt.show()") is NOT here. Stride only
+    // affects the NEXT recording, so a replay-time control for it would be
+    // inert and would imply the current frames could be re-spaced. It belongs
+    // in the rules sheet.
+    +       '<span class="tk-dbg-grp plots" data-el="plotrow" hidden>'
+    +         '<span class="tk-dbg-cap">Plots</span>'
+    +         '<span class="tk-dbg-box">'
+    +           '<span class="tk-dbg-seg">'
+    +             rate('byline', 'line', 'Step one line at a time')
+    +             rate('byframe', 'frame', 'Step one plot at a time')
+    +           '</span>'
+    +           '<span class="tk-dbg-fcount" data-el="fcount"></span>'
+    // Grey, not the red .tk-dbg-btn.exit beside the grid: that one leaves the
+    // debugger entirely. This one only leaves plot mode and returns the pill
+    // to two rows, so it must not read as the same gesture.
+    +           '<button type="button" class="tk-dbg-btn plotoff" data-act="plotsoff"'
+    +             ' title="Turn plots off" aria-label="Turn plots off">'
+    +             '<i class="fa fa-times" aria-hidden="true"></i></button>'
     +         '</span>'
     +       '</span>'
     +     '</span>'
@@ -964,6 +1058,16 @@
       groups[k].classList.toggle('active',
         (isAuto && mode === 'auto') || (isStep && mode === 'step'));
     }
+  }
+
+  // line / frame is a two-state segmented control, painted with aria-pressed
+  // exactly as the AUTO ladder's rate buttons are -- same class, same styling,
+  // and the pressed state carries the meaning for a screen reader rather than
+  // a colour doing it alone.
+  function paintSeg(act, on) {
+    if (!mounted) return;
+    var b = $pill.querySelector('[data-act="' + act + '"]');
+    if (b) b.setAttribute('aria-pressed', on ? 'true' : 'false');
   }
 
   // Opening the pill IS the request to step through -- the student should not
@@ -1572,6 +1676,31 @@
     grp('controls').hidden   = !s.replaying;
     if (!s.replaying) hideHelp();
 
+    // The plot button only exists on the open pill, and only says anything
+    // about a program that actually plots.
+    var plotBtn = $pill.querySelector('[data-act="plotstoggle"]');
+    if (plotBtn) {
+      plotBtn.hidden = !expanded;
+      plotBtn.setAttribute('aria-pressed', plotsOn ? 'true' : 'false');
+    }
+    // The third row is a REPLAY control, so it follows the controls group even
+    // though plotsOn outlives any one recording. Gating it on plotsOn alone
+    // would leave a frame counter and a line/frame switch sitting over a
+    // program that is not being replayed.
+    var showPlotRow = plotsOn && !!s.replaying;
+    var plotRow = el('plotrow');
+    if (plotRow) plotRow.hidden = !showPlotRow;
+    $pill.classList.toggle('plots', showPlotRow);
+    if (showPlotRow) {
+      paintSeg('byline', !stepByFrame);
+      paintSeg('byframe', stepByFrame);
+      var fc = el('fcount');
+      // Frames arrive with the recorder. Until then say nothing rather than
+      // showing a made-up count -- an empty span keeps the row's spacing.
+      if (fc) fc.textContent = (s.frameTotal > 0)
+        ? (s.frameIdx + ' / ' + s.frameTotal) : '';
+    }
+
     if (s.replaying) {
       paintPlay();
       var slider = $pill.querySelector('[data-act="slider"]');
@@ -1649,6 +1778,16 @@
         return;
       }
       if (act === 'bphelp') { toggleHelp(); return; }
+      // Plot mode is the panel's own state: these three never reach
+      // ctx.actions, and they must return before the stopPlay() below --
+      // turning plots on should not pause a recording the student is watching.
+      if (act === 'plotstoggle') { plotsOn = !plotsOn; sync(); return; }
+      if (act === 'plotsoff')    { plotsOn = false;    sync(); return; }
+      if (act === 'byline' || act === 'byframe') {
+        stepByFrame = (act === 'byframe');
+        sync();
+        return;
+      }
       if (act === 'prevbp' || act === 'nextbp') {
         var st = {};
         try { st = ctx.getState() || {}; } catch (e) { st = {}; }
@@ -1905,6 +2044,16 @@
     },
     // Called wherever the debugger's own state changes.
     sync: sync,
+    // Read by runStepThrough immediately before it builds the recorder's
+    // namespace, to decide whether to capture plot frames at all. A GETTER and
+    // no setter: the host asks, the panel owns. It is read rather than passed
+    // as an argument because `actions.start` IS runStepThrough, and the in-tab
+    // #debug-start buttons call it with no arguments -- an argument would
+    // silently give no plots to a student who launched from the Variables tab.
+    wantsPlots: function() { return plotsOn; },
+    // Whether one press of the transport should move one plot instead of one
+    // line. Same timeline either way; only the stride between steps changes.
+    stepsByFrame: function() { return plotsOn && stepByFrame; },
     // A normal Run also answers the edit-exit message: the student has moved on
     // from editing and is looking at output. sync() alone could not clear it --
     // showResult calls exitReplay(true), which returns at its own first line

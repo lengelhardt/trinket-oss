@@ -227,3 +227,143 @@ describe('debug panel — cancelling a queued recording', () => {
     expect(h.calls.start).toBe(1);
   });
 });
+
+describe('debug panel — plot mode and the third row', () => {
+  // The row is a grid item in a grid that declares only its COLUMNS, so it
+  // lands in an implicit third row and no grid CSS changes. jsdom does no
+  // layout, so these assert the state machine; the geometry (84 -> 121, three
+  // 33.5px rows, nothing clipped) was measured in a browser harness rendering
+  // the real panel against the repo's own Foundation CSS.
+  const plotBtn = (d) => d.querySelector('[data-act="plotstoggle"]');
+  const plotRow = (d) => d.querySelector('[data-el="plotrow"]');
+
+  it('plot mode is off until the student asks, and wantsPlots says so', () => {
+    const { panel, doc } = boot({});
+    expect(panel.wantsPlots()).toBe(false);
+    expect(plotRow(doc).hidden).toBe(true);
+    expect(pill(doc).classList.contains('plots')).toBe(false);
+  });
+
+  it('the plot icon is hidden on the collapsed pill and appears when it opens', () => {
+    const { doc } = boot({});
+    expect(plotBtn(doc).hidden).toBe(true);
+    expect(plotBtn(doc)).toBeTruthy();
+    expand(doc);
+    expect(plotBtn(doc).hidden).toBe(false);
+  });
+
+  it('the icon toggles plot mode, and reaches its handler at all', () => {
+    // The delegated listener is on $pill, so a control has to be INSIDE the
+    // pill to be clickable. This is the assertion that proves it — the rules
+    // sheet's planned home in $help fails exactly here.
+    const { panel, doc } = boot({});
+    expand(doc);
+    plotBtn(doc).click();
+    expect(panel.wantsPlots()).toBe(true);
+    expect(plotBtn(doc).getAttribute('aria-pressed')).toBe('true');
+    plotBtn(doc).click();
+    expect(panel.wantsPlots()).toBe(false);
+  });
+
+  it('the row appears only while replaying, though the preference outlives that', () => {
+    const h = boot({ state: { replaying: false } });
+    expand(h.doc);
+    plotBtn(h.doc).click();
+    expect(h.panel.wantsPlots()).toBe(true);
+    // Preference on, but nothing to replay: no frame counter over a program
+    // that is not being stepped.
+    expect(plotRow(h.doc).hidden).toBe(true);
+    expect(pill(h.doc).classList.contains('plots')).toBe(false);
+
+    h.state.replaying = true;
+    h.panel.sync();
+    expect(plotRow(h.doc).hidden).toBe(false);
+    expect(pill(h.doc).classList.contains('plots')).toBe(true);
+  });
+
+  it('the X leaves plot mode and returns the pill to two rows', () => {
+    const h = boot({ state: { replaying: true } });
+    expand(h.doc);
+    plotBtn(h.doc).click();
+    expect(pill(h.doc).classList.contains('plots')).toBe(true);
+
+    h.doc.querySelector('[data-act="plotsoff"]').click();
+    expect(h.panel.wantsPlots()).toBe(false);
+    expect(plotRow(h.doc).hidden).toBe(true);
+    expect(pill(h.doc).classList.contains('plots')).toBe(false);
+    expect(plotBtn(h.doc).getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('line / frame is a two-state control and drives stepsByFrame', () => {
+    const h = boot({ state: { replaying: true } });
+    expand(h.doc);
+    plotBtn(h.doc).click();
+    const byline  = () => h.doc.querySelector('[data-act="byline"]');
+    const byframe = () => h.doc.querySelector('[data-act="byframe"]');
+
+    expect(byline().getAttribute('aria-pressed')).toBe('true');
+    expect(byframe().getAttribute('aria-pressed')).toBe('false');
+    expect(h.panel.stepsByFrame()).toBe(false);
+
+    byframe().click();
+    expect(byframe().getAttribute('aria-pressed')).toBe('true');
+    expect(byline().getAttribute('aria-pressed')).toBe('false');
+    expect(h.panel.stepsByFrame()).toBe(true);
+
+    byline().click();
+    expect(h.panel.stepsByFrame()).toBe(false);
+  });
+
+  it('stepsByFrame is false whenever plot mode is off, whatever was last chosen', () => {
+    // Otherwise turning plots off would leave the host stepping by a frame
+    // list it is no longer being given.
+    const h = boot({ state: { replaying: true } });
+    expand(h.doc);
+    plotBtn(h.doc).click();
+    h.doc.querySelector('[data-act="byframe"]').click();
+    expect(h.panel.stepsByFrame()).toBe(true);
+    h.doc.querySelector('[data-act="plotsoff"]').click();
+    expect(h.panel.stepsByFrame()).toBe(false);
+  });
+
+  it('the frame counter says nothing until the recorder supplies frames', () => {
+    const h = boot({ state: { replaying: true } });
+    expand(h.doc);
+    plotBtn(h.doc).click();
+    const fc = () => h.doc.querySelector('[data-el="fcount"]');
+    expect(fc().textContent).toBe('');
+
+    h.state.frameIdx = 7; h.state.frameTotal = 42;
+    h.panel.sync();
+    expect(fc().textContent).toBe('7 / 42');
+  });
+
+  it('turning plots on does not start, cancel or exit anything', () => {
+    // It is a preference, not a command: it must not reach ctx.actions.
+    const h = boot({ state: { replaying: true } });
+    expand(h.doc);
+    plotBtn(h.doc).click();
+    h.doc.querySelector('[data-act="byframe"]').click();
+    h.doc.querySelector('[data-act="plotsoff"]').click();
+    expect(h.calls.start).toBe(0);
+    expect(h.calls.cancel).toBe(0);
+    expect(h.calls.exit).toBe(0);
+    expect(h.calls.stepTo).toEqual([]);
+  });
+
+  it('the preference survives a launch that never became a recording', () => {
+    // The exact scenario that broke the deferred-recording flag: it was reset
+    // by every exit armRecording has that is not "the recording started".
+    const h = boot({ state: { replaying: false } });
+    expand(h.doc);
+    plotBtn(h.doc).click();
+    expect(h.panel.wantsPlots()).toBe(true);
+
+    h.state.recording = true;  h.panel.sync();
+    h.state.recording = false; h.panel.sync();   // cancelled, never replayed
+    expect(h.panel.wantsPlots()).toBe(true);
+
+    h.panel.afterRun();                          // an ordinary Run afterwards
+    expect(h.panel.wantsPlots()).toBe(true);
+  });
+});
