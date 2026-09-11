@@ -1,8 +1,11 @@
 # Pyodide Step Debugger — scoping / MVP
 
-Status: **scoping — not yet implemented.** Follow-up to the variable explorer
-(#17, #26 / PR #42), which explicitly deferred "live/stepping debugger view"
-as out of scope.
+Status: **Phases 1–3 are implemented** behind `features.stepDebugger`; this
+document is kept as the design record, so read each phase's own "implemented"
+marker rather than this line for what shipped. Follow-up to the variable
+explorer (#17, #26 / PR #42), which explicitly deferred "live/stepping
+debugger view" as out of scope. Amended 2026-09-08 when deferred recording was
+removed — see Phase 3.
 
 A **record & replay** debugger for Pyodide ("Python") trinkets: run the
 program once with a `sys.settrace` recorder, then let the student step
@@ -170,10 +173,15 @@ dependencies. Same blast-radius discipline as the explorer.
     instructor-suggested refinement). Clicking left of a line number toggles a
     breakpoint marker there; replay gains **next/previous-breakpoint**
     navigation that jumps `debugIdx` to the nearest recorded step matching a
-    breakpoint's (file, line). In the record & replay model a breakpoint
-    pauses nothing — it is a navigation filter over the finished recording —
-    so breakpoints are **fully dynamic**: students can add/remove them
-    mid-replay and jump targets update instantly. Ace does the UI natively
+    breakpoint's (file, line). A breakpoint never pauses the **recording** —
+    it is a navigation filter over the finished recording, and since
+    2026-09-08 it is also the stop condition for the floating panel's **auto
+    mode** (`debugAutoStep`, behind `features.debugPanel`), which advances one
+    step and then stops if it landed on a marked line. Either way breakpoints
+    stay **fully dynamic**: students can add/remove them mid-replay, and both
+    the jump targets and the auto-mode stops update instantly, because both
+    read `debugBreakpoints` live rather than anything frozen into the
+    recording. Ace does the UI natively
     (`guttermousedown` for the click, `session.setBreakpoint`/
     `clearBreakpoint` for the classic gutter dot), and the Phase 2 per-file
     sessions give per-file breakpoints in multi-file trinkets for free.
@@ -191,18 +199,54 @@ dependencies. Same blast-radius discipline as the explorer.
     are to clear all breakpoints on the first document change after a
     recording, or to anchor them to Ace markers/`Anchor` objects that Ace
     shifts automatically on edit.
-  - **Deferred recording ("start at first breakpoint")** — the companion
-    feature that makes breakpoints matter for long programs. Navigation-only
-    breakpoints can't reach code the recording never reached: a big early
-    loop can burn the whole 5 000-step cap before the interesting part. With
-    breakpoints set, the tracer stays dormant (no snapshots, minimal
-    overhead) until execution first touches a breakpoint line, then records
-    normally — letting students skip past long preambles rather than merely
-    navigating within what got recorded. Implementation notes: dormant line
-    events are still counted and capped (`_max_dormant`, 200 000) so an
-    infinite loop *before* any breakpoint can't spin forever; the result
-    carries `armed`/`skipped` so the UI can say "recording started at the
-    first breakpoint" or "no breakpoint was reached — nothing recorded".
+  - ~~**Deferred recording ("start at first breakpoint")**~~ — **built, then
+    REMOVED on 2026-09-08. Do not reimplement it.** The idea was that with
+    breakpoints set the tracer would stay dormant until execution first
+    touched a breakpoint line, so a long preamble could not burn the 5 000-step
+    cap. It shipped, and it was wrong in a way the design did not anticipate:
+    a breakpoint that can never be hit (a dead branch, an uncalled `def`, a
+    line in a file the student has since renamed) left the tracer dormant for
+    the whole run, so **every** recording came back empty — and, because
+    `debugBreakpoints` outlives the run, for the rest of the page session. It
+    also violated the one thing students expect of a debugger, which is that
+    the recording starts where the program does.
+
+    What ships instead: **the recording always starts at the program's first
+    line.** `_bp` is still passed to the recorder, but only so it can report
+    `bpHit` — whether any marked line executed — and the marked lines are what
+    auto mode stops on during replay.
+
+    **Superseded 2026-09-09, and this paragraph used to say the opposite.** An
+    earlier revision recorded that `_max_dormant`, `DEBUG_MAX_DORMANT`, the
+    200 000-dormant-line-event cap and the `armed`/`skipped` result keys were
+    *deleted and should not be reimplemented*. They are back, deliberately, as
+    an **opt-in** path: `runStepThrough(defer)` passes `_defer` into
+    `RECORD_HELPER`, which coasts without recording until a marked line is
+    reached, keeping the last `DEBUG_LOOKBACK_STEPS` (100) steps in a ring
+    buffer so the student arrives with a run-up rather than cold. It is offered
+    only by the panel's "record from the breakpoint instead" button, and only
+    after a recording ran out of budget before reaching a marked line — which
+    is the one question the first run cannot answer: whether the line is
+    unreachable, or merely past the cap. The default path still records from
+    line 1. The result carries `truncated`, `bpHit`, and — on a deferred run —
+    `deferred`, `kept` and `skipped`. The remaining
+    bound (5 000 steps / 2 MB) is strictly tighter than the one it replaced.
+
+    The accepted cost, Larry's explicit ruling at the time: a breakpoint
+    **below** a long loop is unreachable, because the step budget goes to
+    whatever runs first (measured: 70 009 line events for `range(10000)` over a
+    6-line body). His words — *"don't put a breakpoint below a
+    10,000-iteration loop is totally fine."* The reserve/coast design that
+    would buy those steps back was scoped and declined.
+
+    **That ruling was later reversed, and this paragraph is kept only for the
+    reasoning.** The coast came back as an *opt-in*: when a recording runs out
+    of budget before reaching a marked line, the panel offers a button, and
+    only that button calls `runStepThrough(true)`, which coasts to the
+    breakpoint under `DEBUG_MAX_DORMANT` and keeps a `DEBUG_LOOKBACK_STEPS`
+    ring of the steps before it. So the student now gets *both* — an honest
+    note, and a recovery they have to ask for. The default path is unchanged
+    and still records from line 1. See `debugger-panel.md` for the mechanism.
   - **Loop-iteration jump** ("next time line 8 runs") — largely subsumed by
     next-breakpoint navigation on a breakpointed line; keep only if a
     dedicated control proves necessary.

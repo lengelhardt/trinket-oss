@@ -185,7 +185,7 @@ test.describe('Pyodide console.py shadow guard (#1)', () => {
     const newShortCode = (await res.json()).data.mapping[shortCode];
     expect(newShortCode, 'import returned a new shortCode').toBeTruthy();
 
-    const resp = await page.goto(`/embed/python3/${newShortCode}`);
+    const resp = await page.goto(`/embed/python3/${newShortCode}?runtime=main`);
     expect(resp.status()).toBe(200);
     // A two-file trinket renders one ACE editor per file, so scope to the first.
     await expect(page.locator('.ace_editor').first()).toBeVisible();

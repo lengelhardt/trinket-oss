@@ -1,0 +1,1045 @@
+<title>Trinket Debug Panel Specimen</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;600;700&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+  /* ============================================================
+     Two deliberate visual registers.
+
+     (1) THE FRAME - this page. Cool grey biased toward Trinket's
+         own #2b6c9e, Archivo + Plex. Theme-aware.
+     (2) THE SPECIMEN - the mock embed. Always light, because
+         Trinket has no dark mode and forces theme="light". Its
+         colours are literals read out of the codebase, not
+         chosen here: #2b6c9e (.debug-btn), #14435f (:hover),
+         #a94442 (.debug-bp-btn), #d9d9d9 (.tab-nav border),
+         #525252 (.tab-nav a). Do not "improve" them.
+     ============================================================ */
+  :root {
+    --ground:   #eef1f4;
+    --panel:    #ffffff;
+    --panel-2:  #e4e9ee;
+    --rule:     #cfd8e0;
+    --rule-soft:#e0e6ec;
+    --ink:      #17212a;
+    --ink-soft: #4a5b69;
+    --ink-faint:#78899a;
+    --accent:      #2b6c9e;
+    --accent-deep: #14435f;
+    --accent-wash: #e7f0f7;
+    --red:      #a94442;
+    --amber:    #b06000;
+    --green:    #2e7d32;
+
+    --display: "Archivo", ui-sans-serif, system-ui, sans-serif;
+    --body:    "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+    --mono:    "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --ground:   #121a21;
+      --panel:    #1a242d;
+      --panel-2:  #212e38;
+      --rule:     #2f404c;
+      --rule-soft:#26343e;
+      --ink:      #e3eaf0;
+      --ink-soft: #a5b6c3;
+      --ink-faint:#77899a;
+      --accent:      #74b4e0;
+      --accent-deep: #a3d2f2;
+      --accent-wash: #17262f;
+      --red:      #e78e8a;
+      --amber:     #dfa252;
+      --green:    #7fc783;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground:   #121a21;
+    --panel:    #1a242d;
+    --panel-2:  #212e38;
+    --rule:     #2f404c;
+    --rule-soft:#26343e;
+    --ink:      #e3eaf0;
+    --ink-soft: #a5b6c3;
+    --ink-faint:#77899a;
+    --accent:      #74b4e0;
+    --accent-deep: #a3d2f2;
+    --accent-wash: #17262f;
+    --red:      #e78e8a;
+    --amber:     #dfa252;
+    --green:    #7fc783;
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    background: var(--ground);
+    color: var(--ink);
+    font-family: var(--body);
+    font-size: 15px;
+    line-height: 1.6;
+    margin: 0;
+    padding: 0 20px 80px;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1080px; margin: 0 auto; }
+  .narrow { max-width: 68ch; }
+
+  /* ---- frame header ---- */
+  header.top { padding: 44px 0 22px; }
+  .eyebrow {
+    font-family: var(--mono);
+    font-size: 11px; letter-spacing: .14em; text-transform: uppercase;
+    color: var(--accent); margin: 0 0 12px;
+  }
+  h1 {
+    font-family: var(--display); font-weight: 700;
+    font-size: clamp(30px, 5vw, 42px); line-height: 1.04;
+    letter-spacing: -.02em; margin: 0 0 14px; text-wrap: balance;
+  }
+  .standfirst { font-size: 18px; line-height: 1.5; color: var(--ink-soft); margin: 0; max-width: 62ch; }
+  .provenance {
+    font-family: var(--mono); font-size: 11.5px; line-height: 1.8;
+    color: var(--ink-faint); margin: 18px 0 0;
+    border-top: 1px solid var(--rule-soft); padding-top: 14px;
+  }
+  .provenance b { color: var(--ink-soft); font-weight: 500; }
+
+  h2 {
+    font-family: var(--display); font-weight: 600; font-size: 21px;
+    letter-spacing: -.01em; margin: 46px 0 6px; text-wrap: balance;
+  }
+  h2 + .dek { font-size: 14px; color: var(--ink-faint); margin: 0 0 18px; }
+  p { margin: 0 0 13px; }
+  a { color: var(--accent); }
+  code {
+    font-family: var(--mono); font-size: .86em;
+    background: var(--panel-2); padding: 1px 4px; border-radius: 2px;
+  }
+  .lbl {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .12em;
+    text-transform: uppercase; color: var(--ink-faint);
+  }
+
+  /* ============ THE SPECIMEN ============ */
+  .bezel {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 10px;
+    padding: 10px;
+    box-shadow: 0 18px 44px -22px rgba(12, 30, 45, .5);
+  }
+  .bezel-bar {
+    display: flex; align-items: center; gap: 10px;
+    padding: 2px 6px 10px; font-family: var(--mono);
+    font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase;
+    color: var(--ink-faint);
+  }
+  .bezel-bar .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--rule); }
+  .bezel-bar .spacer { flex: 1; }
+  .bezel-bar .live { color: var(--green); }
+
+  /* the mock embed: a light island, Trinket's own values */
+  .embed {
+    position: relative;
+    background: #fff;
+    color: #141413;
+    border: 1px solid #d9d9d9;
+    border-radius: 3px;
+    overflow: hidden;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+    color-scheme: light;
+  }
+
+  /* toolbar row */
+  .tk-toolbar {
+    display: flex; align-items: stretch;
+    height: 40px; border-bottom: 1px solid #d9d9d9; background: #fff;
+  }
+  .tk-toolbar > * {
+    display: flex; align-items: center; gap: 7px;
+    padding: 0 13px; border-right: 1px solid #e6e6e6;
+    font-size: 13.5px; color: #333; white-space: nowrap;
+  }
+  .tk-toolbar .tk-run { color: #222; font-weight: 500; cursor: pointer; }
+  .tk-toolbar .tk-run:hover { background: #f4f7f9; }
+  .tk-toolbar .tk-caret { padding: 0 9px; }
+  .tk-brand { font-family: var(--mono); font-size: 10px; letter-spacing: .1em; color: #6b7f8c; }
+  .tk-toolbar .tk-end { border-right: 0; }
+
+  /* file-tab bar - real geometry: 2.275rem tall, overflow hidden */
+  .tk-tabnav {
+    position: relative;
+    display: flex; align-items: stretch;
+    height: 2.275rem; border-bottom: 1px solid #d9d9d9;
+    overflow: hidden; background: #fbfbfb;
+  }
+  .tk-tabnav .arrows { display: flex; align-items: center; gap: 2px; padding: 0 6px; color: #525252; }
+  .tk-tabs { display: flex; align-items: flex-end; }
+  .tk-tab {
+    display: flex; align-items: center; padding: 0 16px; height: 100%;
+    font-size: 13.5px; color: #333; background: #fff;
+    border-right: 1px solid #e6e6e6; border-top: 3px solid #141413;
+  }
+  .tk-tabnav .gap { flex: 1; min-width: 40px; }
+  .tk-tabnav .right-options { display: flex; align-items: center; gap: 4px; padding: 0 8px; color: #525252; }
+  .tk-tabnav .right-options .ic { padding: 3px; }
+  .tk-tabnav .right-options .boxed { background: #eceff1; border-left: 1px solid #e0e0e0; padding: 8px 9px; }
+
+  /* body: code | output */
+  .tk-body { display: grid; grid-template-columns: 1.08fr 1fr; min-height: 372px; }
+  .tk-code { border-right: 1px solid #d9d9d9; display: flex; font-size: 12.5px; overflow: hidden; }
+  .tk-gutter {
+    background: #f0f0f0; color: #999; text-align: right;
+    padding: 6px 0; font-family: var(--mono); font-size: 11.5px;
+    user-select: none; flex: 0 0 46px;
+  }
+  .tk-gutter div {
+    height: 17px; line-height: 17px; padding: 0 7px 0 4px; position: relative; cursor: pointer;
+  }
+  .tk-gutter div:hover { color: #555; background: #e8e8e8; }
+  .tk-gutter div.bp {
+    color: #fff; background: #a94442;
+    border-radius: 20px 0 0 20px;
+    box-shadow: 0 0 1px 2px rgba(192,57,43,.85) inset;
+  }
+  .tk-src { flex: 1; padding: 6px 0; font-family: var(--mono); font-size: 11.5px; overflow: auto; }
+  .tk-src div {
+    height: 17px; line-height: 17px; padding: 0 10px; white-space: pre;
+  }
+  .tk-src div.cur { background: #fff6d8; box-shadow: inset 2px 0 0 #e0a800; }
+  .tk-src .k { color: #0000c0; }
+  .tk-src .s { color: #008000; }
+  .tk-src .n { color: #a31515; }
+  .tk-src .c { color: #999; font-style: italic; }
+  .tk-src .f { color: #7a3e9d; }
+
+  .tk-out { display: flex; flex-direction: column; background: #fff; min-width: 0; }
+  .tk-outtabs { display: flex; border-bottom: 1px solid #d9d9d9; font-size: 12.5px; }
+  .tk-outtabs div {
+    flex: 1; text-align: center; padding: 7px 4px; color: #555;
+    border-right: 1px solid #e6e6e6; cursor: pointer;
+  }
+  .tk-outtabs div.active { color: #141413; font-weight: 600; box-shadow: inset 0 -3px 0 #2b6c9e; }
+  .tk-outtabs div:last-child { border-right: 0; }
+  .tk-graphic { flex: 1; display: flex; align-items: center; justify-content: center; padding: 6px; overflow: auto; min-height: 0; }
+  .tk-graphic canvas { max-width: 100%; }
+  .tk-console {
+    flex: 0 0 92px; border-top: 1px solid #d9d9d9; background: #fff;
+    font-family: var(--mono); font-size: 11px; line-height: 1.55;
+    padding: 6px 9px; overflow: auto; color: #222; white-space: pre-wrap;
+  }
+  .tk-console:empty::after { content: "— no output yet —"; color: #aaa; }
+
+  /* variables table inside the Variables tab view */
+  .tk-vars { flex: 1; overflow: auto; min-height: 0; }
+  table.vars { width: 100%; border-collapse: collapse; font-size: 12px; }
+  table.vars thead th {
+    position: sticky; top: 0; background: #f6f6f6; text-align: left;
+    font-size: 10px; letter-spacing: .08em; text-transform: uppercase;
+    color: #888; font-weight: 500; padding: 5px 6px; border-bottom: 1px solid #e0e0e0;
+  }
+  table.vars td { padding: 3px 6px; border-bottom: 1px solid #f0f0f0; vertical-align: top; }
+  table.vars td.clip { width: 22px; padding: 3px 0 3px 5px; }
+  table.vars td.nm { color: #1a7f37; font-family: var(--mono); white-space: nowrap; }
+  table.vars td.ty { color: #6f42c1; font-family: var(--mono); white-space: nowrap; }
+  table.vars td.vl { color: #222; font-family: var(--mono); word-break: break-all; }
+  table.vars tr.changed td.vl { background: #fff6d8; }
+  table.vars tr.changed td.nm { font-weight: 600; }
+  table.vars tr.pinned { background: #f3f8fc; }
+  table.vars .len { color: #aaa; }
+  .clipbtn {
+    border: 0; background: none; padding: 0; cursor: pointer; color: #c8c8c8;
+    line-height: 1; display: block;
+  }
+  .clipbtn:hover { color: #2b6c9e; }
+  .clipbtn.on { color: #2b6c9e; }
+  .clipbtn:focus-visible { outline: 2px solid #2b6c9e; outline-offset: 1px; }
+
+  /* ---------- the proposed panel: plotpolish's pill idiom ---------- */
+  .layer { position: absolute; inset: 0; pointer-events: none; z-index: 40; }
+  .pill {
+    position: absolute; pointer-events: auto;
+    display: flex; align-items: stretch; gap: 0;
+    background: #e7f0f7; border: 1px solid #b9d0e2;
+    border-radius: 999px; box-shadow: 0 4px 14px rgba(0,0,0,.22);
+    font-family: -apple-system, BlinkMacSystemFont, sans-serif;
+    transition: box-shadow 140ms ease;
+    max-width: calc(100% - 16px);
+  }
+  .pill.dragging { box-shadow: 0 10px 28px rgba(0,0,0,.28); transition: none; }
+  .pill .grip {
+    display: flex; align-items: center; gap: 2px;
+    padding: 0 6px 0 8px; cursor: grab; border-radius: 999px 0 0 999px;
+    flex: 0 0 auto;
+  }
+  .pill.dragging .grip { cursor: grabbing; }
+  .pill .grip i {
+    width: 3px; height: 3px; border-radius: 50%; background: #6d8ea8; display: block;
+  }
+  .pill .grip .col { display: flex; flex-direction: column; gap: 2px; }
+  .dbg-toggle {
+    display: flex; flex-direction: column; align-items: center; justify-content: center;
+    gap: 1px; border: 0; background: none; cursor: pointer;
+    padding: 3px 9px 3px 3px; color: #2b6c9e; border-radius: 0 999px 999px 0;
+    flex: 0 0 auto;
+  }
+  .dbg-toggle:hover { color: #14435f; }
+  .dbg-toggle:focus-visible { outline: 2px solid #2b6c9e; outline-offset: 2px; }
+  .dbg-toggle .word {
+    font-size: 8.5px; font-weight: 700; letter-spacing: .13em; line-height: 1;
+  }
+  .pill.open .dbg-toggle { border-radius: 0; border-right: 1px solid #c3d6e5; padding-right: 8px; }
+
+  .dbg-body {
+    display: none; align-items: center; gap: 2px;
+    padding: 0 6px 0 7px; min-width: 0;
+  }
+  .pill.open .dbg-body { display: flex; }
+  .dbg-btn {
+    border: 0; background: none; cursor: pointer; color: #2b6c9e;
+    padding: 4px 4px; line-height: 1; border-radius: 4px; flex: 0 0 auto;
+  }
+  .dbg-btn:hover { color: #14435f; background: #d9e8f3; }
+  .dbg-btn:focus-visible { outline: 2px solid #2b6c9e; outline-offset: 1px; }
+  .dbg-btn.bp { color: #a94442; }
+  .dbg-btn[aria-pressed="true"] { background: #cfe2f0; }
+  .dbg-slider { width: 118px; margin: 0 4px; accent-color: #2b6c9e; height: 14px; }
+  .dbg-pos {
+    font-family: var(--mono); font-size: 10.5px; color: #14435f;
+    font-variant-numeric: tabular-nums; white-space: nowrap; padding: 0 3px;
+  }
+  .dbg-sep { width: 1px; align-self: stretch; background: #c3d6e5; margin: 4px 3px; }
+  .dbg-speed {
+    font-family: var(--mono); font-size: 9.5px; color: #2b6c9e;
+    border: 1px solid #b9d0e2; border-radius: 999px; background: #fff;
+    padding: 1px 5px; cursor: pointer;
+  }
+
+  /* the docked watch window - plotpolish's popover, hung under the pill */
+  .watch {
+    position: absolute; top: calc(100% + 7px); left: 0;
+    width: 342px; max-width: 92vw;
+    background: #fff; border: 1px solid #b9d0e2; border-radius: 8px;
+    box-shadow: 0 6px 20px rgba(0,0,0,.18);
+    padding: 7px 8px 8px; display: none;
+  }
+  .pill.open .watch.shown { display: block; }
+  .watch::before {
+    content: ""; position: absolute; top: -5px; left: 22px;
+    width: 8px; height: 8px; background: #fff;
+    border-left: 1px solid #b9d0e2; border-top: 1px solid #b9d0e2;
+    transform: rotate(45deg);
+  }
+  .watch h4 {
+    margin: 0 0 6px; font-size: 9.5px; letter-spacing: .12em; text-transform: uppercase;
+    color: #7b8b98; font-weight: 600; display: flex; align-items: center; gap: 6px;
+  }
+  .watch h4 .hint { font-weight: 400; letter-spacing: 0; text-transform: none; font-size: 10.5px; color: #9aa8b4; }
+  .wrow { display: grid; grid-template-columns: 62px 66px 1fr auto; gap: 0 7px; align-items: center; padding: 3px 0; border-top: 1px solid #f0f4f7; }
+  .wrow:first-of-type { border-top: 0; }
+  .wrow .wn { font-family: var(--mono); font-size: 11.5px; color: #1a7f37; }
+  .wrow .wv { font-family: var(--mono); font-size: 11.5px; color: #141413; font-variant-numeric: tabular-nums; text-align: right; }
+  .wrow .wv.undef { color: #b0b0b0; font-style: italic; font-size: 10.5px; }
+  .wrow .spark { height: 20px; display: block; cursor: crosshair; }
+  .wrow .unpin { border: 0; background: none; cursor: pointer; color: #c0ccd6; padding: 2px; line-height: 1; }
+  .wrow .unpin:hover { color: #a94442; }
+  .watch .empty { font-size: 11.5px; color: #9aa8b4; padding: 4px 2px; }
+
+  /* ---- annotation blocks in the frame ---- */
+  .specs { display: grid; grid-template-columns: repeat(auto-fit, minmax(232px, 1fr)); gap: 0; margin: 22px 0 0; border-top: 1px solid var(--rule); }
+  .specs > div { padding: 15px 18px 15px 0; border-bottom: 1px solid var(--rule-soft); }
+  .specs dt { font-family: var(--mono); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--accent); margin-bottom: 5px; }
+  .specs dd { margin: 0; font-size: 14px; color: var(--ink-soft); line-height: 1.5; }
+  .specs dd b { color: var(--ink); font-weight: 600; }
+
+  .split { display: grid; grid-template-columns: 1fr 1fr; gap: 0 40px; }
+  @media (max-width: 760px) { .split { grid-template-columns: 1fr; gap: 0; } .tk-body { grid-template-columns: 1fr; } .tk-code { border-right: 0; border-bottom: 1px solid #d9d9d9; } }
+
+  .card { border-left: 3px solid var(--rule); background: var(--panel); padding: 13px 16px; margin: 0 0 14px; font-size: 14px; }
+  .card .tag { display: block; font-family: var(--mono); font-size: 10px; letter-spacing: .11em; text-transform: uppercase; margin-bottom: 5px; }
+  .card p:last-child { margin-bottom: 0; }
+  .card.real  { border-left-color: var(--green); } .card.real .tag  { color: var(--green); }
+  .card.fake  { border-left-color: var(--amber); } .card.fake .tag  { color: var(--amber); }
+  .card.ask   { border-left-color: var(--accent); } .card.ask .tag  { color: var(--accent); }
+
+  ol.q { padding-left: 20px; margin: 0; }
+  ol.q li { margin-bottom: 9px; font-size: 14.5px; color: var(--ink-soft); }
+  ol.q li b { color: var(--ink); font-weight: 600; }
+
+  footer { margin-top: 52px; padding-top: 18px; border-top: 1px solid var(--rule); font-size: 13px; color: var(--ink-faint); }
+  footer code { background: var(--panel-2); }
+
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+
+<header class="top">
+  <p class="eyebrow">Trinket &middot; wish 3 &middot; interaction specimen</p>
+  <h1>The DEBUG panel, operable</h1>
+  <p class="standfirst">A working mock of the proposed floating debugger: drag it by the grip, scrub the slider, and watch the projectile plot redraw one frame per loop iteration. The chrome around it is a facsimile of the Pyodide embed; the panel is the actual proposal.</p>
+  <p class="provenance" style="border:1px solid #b06000;border-left-width:4px;padding:10px 12px;color:#7a4400;background:#fff8ef">
+    <b>SUPERSEDED 2026-09-08 &mdash; this is the pre-build proposal, not the shipped panel.</b>
+    Slice&nbsp;1 is built on <code>feature/debug-panel</code> behind <code>features.debugPanel</code>, and it diverges from this specimen in three ways that matter:
+    (1) the transport is a <b>2&times;2 grid of three captioned boxes</b> (STEP MODE / AUTO MODE / BREAKPOINTS), not the single row shown here;
+    (2) AUTO MODE is a <b>forward-only ladder of five fixed rates</b> &mdash; 1/5, 1/2, play, 2, 5 lines per second, the slow two drawn as stacked fractions &mdash; and <b>backwards autoplay was deleted</b>;
+    (3) <b>autoplay stops at breakpoints</b> (<code>debugAutoStep</code> advances one step, then tests where it landed), which the autoplay demonstrated below deliberately ignores.
+    Also shipped and not shown here: no message of any kind renders inside the pill &mdash; they all go to the top of the floating variables window.
+    Keep this file for the interaction argument it makes; do not read geometry or behaviour off it.
+  </p>
+  <p class="provenance">
+    <b>Specimen only &mdash; no Trinket file was changed to build this.</b> Geometry and colour are read out of <code>main</code> at <code>7706618</code>: <code>.tab-nav</code> is 2.275&nbsp;rem tall with <code>overflow: hidden</code> (<code>_code_editor.scss:332</code>), which is why the panel floats on an overlay rather than living in the bar; <code>#2b6c9e</code> / <code>#14435f</code> / <code>#a94442</code> are <code>.debug-btn</code>, its hover, and <code>.debug-bp-btn</code>.<br>
+    Panel idiom lifted from plotpolish&rsquo;s <code>.pill.float</code> / <code>.pill.collapsed</code> / <code>.popover</code>. Icons are hand-drawn stand-ins &mdash; the embed uses Font&nbsp;Awesome&nbsp;4, which cannot load here.
+  </p>
+</header>
+
+<div class="bezel">
+  <div class="bezel-bar">
+    <span class="dot"></span><span class="dot"></span><span class="dot"></span>
+    <span>facsimile &mdash; /embed/pyodide</span>
+    <span class="spacer"></span>
+    <span class="live" id="liveTag">recording loaded &middot; 34 frames</span>
+  </div>
+
+  <div class="embed" id="embed">
+    <div class="tk-toolbar">
+      <div><svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><g stroke="#333" stroke-width="1.6" stroke-linecap="round"><path d="M2 4h12M2 8h12M2 12h12"/></g></svg></div>
+      <div class="tk-brand">&#8767;&nbsp;PICUP</div>
+      <div><svg width="14" height="14" viewBox="0 0 16 16" aria-hidden="true"><path fill="#3572A5" d="M7.7 1c-1.9 0-3 .6-3 2.2v1.5h4.3v.7H3.2C1.7 5.4 1 6.3 1 8.2s.7 2.9 2.2 2.9h1.2V9.3c0-1.4 1-2.4 2.4-2.4h3c1.2 0 2.1-.8 2.1-2.1V3.2C11.9 1.7 10.9 1 9.4 1zm-1.4.9a.7.7 0 110 1.4.7.7 0 010-1.4z"/><path fill="#FFD43B" d="M8.3 15c1.9 0 3-.6 3-2.2v-1.5H7v-.7h5.8c1.5 0 2.2-.9 2.2-2.8S14.3 4.9 12.8 4.9h-1.2v1.8c0 1.4-1 2.4-2.4 2.4h-3C5 9.1 4.1 9.9 4.1 11.2v1.6C4.1 14.3 5.1 15 6.6 15zm1.4-.9a.7.7 0 110-1.4.7.7 0 010 1.4z"/></svg> Python</div>
+      <div class="tk-run" id="runBtn"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="#222" d="M3 2l11 6-11 6z"/></svg> Run</div>
+      <div class="tk-caret"><svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><path fill="#555" d="M2 5l6 7 6-7z"/></svg></div>
+      <div class="tk-end"><svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true"><path fill="#555" d="M6 13l-4-4 7-7 5 5-7 7zm-3.3-4L6 12.3 11.3 7 8 3.7 2.7 9z"/></svg> Clear memory</div>
+    </div>
+
+    <div class="tk-tabnav">
+      <div class="arrows">
+        <svg width="11" height="11" viewBox="0 0 16 16" aria-hidden="true"><path fill="#525252" d="M11 2L4 8l7 6z"/></svg>
+        <svg width="11" height="11" viewBox="0 0 16 16" aria-hidden="true"><path fill="#525252" d="M5 2l7 6-7 6z"/></svg>
+      </div>
+      <div class="tk-tabs"><div class="tk-tab">main.py</div></div>
+      <div class="gap"></div>
+      <div class="right-options">
+        <span class="ic"><svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true"><path fill="#525252" d="M7 2h2v5h5v2H9v5H7V9H2V7h5z"/></svg></span>
+        <span class="ic"><svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true"><path fill="#525252" d="M8 1l4 5H9.5v4h-3V6H4zM2 12h12v2H2z"/></svg></span>
+        <span class="ic"><svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true"><path fill="#525252" d="M2 2h12v9H8l-4 3v-3H2z"/></svg></span>
+        <span class="boxed"><svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true"><path fill="#525252" d="M1 3h14v10H1zm1.4 8.6h11.2l-3.4-4-2.6 3-1.8-2z"/><circle cx="5" cy="6" r="1.2" fill="#525252"/></svg></span>
+      </div>
+    </div>
+
+    <div class="tk-body">
+      <div class="tk-code">
+        <div class="tk-gutter" id="gutter"></div>
+        <div class="tk-src" id="src"></div>
+      </div>
+      <div class="tk-out">
+        <div class="tk-outtabs">
+          <div class="active" data-view="result" id="tabResult">Result</div>
+          <div data-view="vars" id="tabVars">Variables <span id="varCount"></span></div>
+        </div>
+        <div class="tk-graphic" id="graphic"><canvas id="plot" width="900" height="640"></canvas></div>
+        <div class="tk-vars" id="varsView" hidden>
+          <table class="vars">
+            <thead><tr><th></th><th>Name</th><th>Type</th><th>Value</th></tr></thead>
+            <tbody id="varsBody"></tbody>
+          </table>
+        </div>
+        <div class="tk-console" id="console"></div>
+      </div>
+    </div>
+
+    <!-- overlay layer: the panel lives here, NOT in .tab-nav -->
+    <div class="layer" id="layer">
+      <div class="pill open" id="pill" style="left: 300px; top: 47px;">
+        <span class="grip" id="grip" role="button" tabindex="0" aria-label="Drag the debug panel" title="Drag me anywhere">
+          <span class="col"><i></i><i></i><i></i></span>
+          <span class="col"><i></i><i></i><i></i></span>
+        </span>
+        <button class="dbg-toggle" id="toggle" aria-expanded="true" title="Step through this program">
+          <span class="word">DEBUG</span>
+          <svg width="15" height="15" viewBox="0 0 16 16" aria-hidden="true"><g fill="currentColor"><ellipse cx="8" cy="9.4" rx="3.3" ry="4"/><circle cx="8" cy="4.1" r="2.1"/><path d="M8.6 1.2l1.9-1 .5.9-1.9 1zM5.5 1.1l.5-.9 1.9 1-.5.9zM1.2 7.2l3.1.6-.2 1-3.1-.6zM11.9 7.8l3.1-.6.2 1-3.1.6zM1.5 12.4l2.8-1.4.5.9-2.8 1.4zM11.7 11l2.8 1.4-.5.9-2.8-1.4z"/></g></svg>
+        </button>
+
+        <span class="dbg-body">
+          <button class="dbg-btn" id="bFirst" title="First step"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M14 2v12L8 8zM8 2v12L2 8zM1 2h1.4v12H1z"/></svg></button>
+          <button class="dbg-btn" id="bBack" title="Previous step (&larr;)"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M13 2v12L4 8zM2 2h1.6v12H2z"/></svg></button>
+          <input type="range" class="dbg-slider" id="slider" min="0" max="0" value="0" aria-label="Step position">
+          <span class="dbg-pos" id="pos">0 / 0</span>
+          <button class="dbg-btn" id="bFwd" title="Next step (&rarr;)"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M3 2v12l9-6zM12.4 2H14v12h-1.6z"/></svg></button>
+          <button class="dbg-btn" id="bLast" title="Last step"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M2 2v12l6-6zM8 2v12l6-6zM13.6 2H15v12h-1.4z"/></svg></button>
+          <span class="dbg-sep"></span>
+          <button class="dbg-btn" id="bPlay" aria-pressed="false" title="Play / pause"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true" id="playIcon"><path fill="currentColor" d="M3 2l11 6-11 6z"/></svg></button>
+          <button class="dbg-speed" id="bSpeed" title="Steps per second">4/s</button>
+          <span class="dbg-sep"></span>
+          <button class="dbg-btn bp" id="bPrevBp" title="Previous breakpoint (Shift+&larr;)"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1a7 7 0 100 14A7 7 0 008 1zm2 3.4v7.2L5.4 8z"/></svg></button>
+          <button class="dbg-btn bp" id="bNextBp" title="Next breakpoint (Shift+&rarr;)"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M8 1a7 7 0 110 14A7 7 0 018 1zM6 4.4v7.2L10.6 8z"/></svg></button>
+          <span class="dbg-sep"></span>
+          <button class="dbg-btn" id="bWatch" aria-pressed="true" title="Show the watch window"><svg width="13" height="13" viewBox="0 0 16 16" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" d="M11.4 5.1L6.2 10.3a2 2 0 002.9 2.9l5.1-5.2a3.6 3.6 0 00-5.1-5.1L3.4 8.6a5.2 5.2 0 007.3 7.3"/></svg></button>
+          <button class="dbg-btn" id="bExit" title="Exit step-through"><svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" d="M13 4.2L11.8 3 8 6.8 4.2 3 3 4.2 6.8 8 3 11.8 4.2 13 8 9.2 11.8 13 13 11.8 9.2 8z"/></svg></button>
+        </span>
+
+        <div class="watch shown" id="watch">
+          <h4>Watching <span class="hint" id="watchHint">click a paperclip in Variables to pin</span></h4>
+          <div id="watchRows"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<dl class="specs">
+  <div>
+    <dt>Collapsed</dt>
+    <dd>Grip, then <b>DEBUG</b> over a bug icon. Click the word to fold the controls away; the grip stays, so it never becomes unfindable.</dd>
+  </div>
+  <div>
+    <dt>Draggable</dt>
+    <dd>The grip moves the whole thing, panel and watch window together. Default position is the empty span of the file-tab bar &mdash; <b>docked by arithmetic, not by parentage</b>.</dd>
+  </div>
+  <div>
+    <dt>Watch window</dt>
+    <dd>Hangs below on a caret, plotpolish&rsquo;s popover shape. Each pinned variable shows its value <em>and its whole trajectory</em> &mdash; click a sparkline to jump to that step.</dd>
+  </div>
+  <div>
+    <dt>Result stays open</dt>
+    <dd>The reason for all of it: stepping no longer forces you into the Variables tab, so the plot is visible while you step. Switch tabs and the panel does not move.</dd>
+  </div>
+</dl>
+
+<h2>What is real here, and what is faked</h2>
+<p class="dek">So nobody has to guess which parts are claims about the implementation.</p>
+
+<div class="split">
+  <div>
+    <div class="card real">
+      <span class="tag">Real &mdash; behaves as the build would</span>
+      <p>The recording is a genuine trace: 34 loop iterations of the program on the left, one step per executed line, <b>491 steps</b> and <b>34 captured frames</b>. Stepping is a walk over a finished array, exactly as record &amp; replay works today.</p>
+      <p>Frames are sparse against steps &mdash; captured only where <code>plt.plot</code> runs, which is the <code>fig.stale</code> policy in miniature. The plot shows the newest frame at or before the current step, so scrubbing backwards un-draws the trajectory.</p>
+      <p>Console output is revealed by recorded offset, not replayed wholesale. Changed variables are diffed against the previous step. Pinned rows sort to the top. Gutter dots are clickable and the breakpoint jumps honour them.</p>
+    </div>
+  </div>
+  <div>
+    <div class="card fake">
+      <span class="tag">Faked &mdash; do not read as a claim</span>
+      <p>No Python runs. The trace was generated in JavaScript from the same Euler integration the program describes, so the numbers are right but nothing was traced by <code>sys.settrace</code>.</p>
+      <p>Frames are drawn to a canvas rather than rasterised by matplotlib, so this says nothing about the real cost of <code>draw()</code>&nbsp;+&nbsp;<code>savefig</code> &mdash; the estimate assumes 10&ndash;40&nbsp;ms each, and that is the number to measure first.</p>
+      <p>The chrome is a facsimile: no Ace, no real tabs, one file. Arrow-key adjudication between the panel and the editor &mdash; a real design question &mdash; cannot be shown here, because there is no editor to lose focus to.</p>
+    </div>
+    <div class="card ask">
+      <span class="tag">Swap in your own program</span>
+      <p>The trace is generated from one function at the top of the script. Replacing the projectile integration with a loop from an actual assignment is a few lines, and it is what settles the capture policy for real.</p>
+    </div>
+  </div>
+</div>
+
+<h2>Open questions this specimen is meant to settle</h2>
+<p class="dek">Each one is cheaper to answer by clicking than by discussing.</p>
+
+<ol class="q">
+  <li><b>Does the pill belong in the tab bar at all?</b> It is docked there by default here. Try dragging it over the plot, or to the bottom-left, and see which reads better.</li>
+  <li><b>Should the watch window dock under the panel, or pin to a corner?</b> Under the panel it follows the drag, which is tidy until the panel is near the bottom edge.</li>
+  <li><b>Value only, or the full trajectory?</b> The sparklines cost about a day. They are also the thing no live debugger can do.</li>
+  <li><b>Autoplay speed:</b> five detents (&frac15;, &frac12;, 1, 2, 4 steps/sec) rather than a continuous slider. Cycle the pill&rsquo;s speed chip to feel whether five is enough.</li>
+  <li><b>Does <code>DEBUG</code> over a bug icon read as &ldquo;step through my program&rdquo;</b> to someone who has never used a debugger? That is the whole discoverability bet.</li>
+</ol>
+
+<footer>
+  Specimen for wish 3 of the Trinket wish list, 2026-09-08. Chrome measured against <code>PICUP-Physics/trinket-oss</code> at <code>7706618</code>; <code>public/js/embed/pyodide.js</code> blob <code>a275821</code>. Nothing in that repository was modified to produce this page &mdash; it is a standalone file, so the debugger work and everything else can proceed in parallel.
+</footer>
+
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* ------------------------------------------------------------------
+     The program under test. Line numbers below are 1-based and are
+     what the gutter, the highlight and the breakpoints all refer to.
+     ------------------------------------------------------------------ */
+  var SRC = [
+    'import numpy as np',
+    'import matplotlib.pyplot as plt',
+    '',
+    'v0    = 20.0            # launch speed, m/s',
+    'theta = np.radians(55)  # launch angle',
+    'dt    = 0.1             # timestep, s',
+    'b     = 0.02            # drag coefficient',
+    '',
+    't, x, y = 0.0, 0.0, 0.0',
+    'vx = v0 * np.cos(theta)',
+    'vy = v0 * np.sin(theta)',
+    'xs, ys = [x], [y]',
+    '',
+    'while y >= 0.0:',
+    '    t  += dt',
+    '    v   = np.hypot(vx, vy)',
+    '    ax  = -b * v * vx',
+    '    ay  = -9.8 - b * v * vy',
+    '    vx += ax * dt',
+    '    vy += ay * dt',
+    '    x  += vx * dt',
+    '    y  += vy * dt',
+    '    xs.append(x)',
+    '    ys.append(y)',
+    '    plt.clf()',
+    '    plt.plot(xs, ys)',
+    '    print(f"t = {t:4.1f} s   y = {y:6.2f} m")',
+    '',
+    'plt.xlabel("x (m)")',
+    'plt.ylabel("y (m)")',
+    'plt.title("projectile with linear drag")',
+    'plt.show()',
+    'print(f"range: {x:.1f} m")'
+  ];
+
+  /* ---- build the recording -------------------------------------- */
+  function f(n, d) { return Number(n.toFixed(d)); }
+
+  function record() {
+    var steps = [], frames = [], out = '';
+    var v0 = 20.0, theta = 55 * Math.PI / 180, dt = 0.1, b = 0.02;
+    var t = 0, x = 0, y = 0;
+    var vx = v0 * Math.cos(theta), vy = v0 * Math.sin(theta);
+    var xs = [0], ys = [0];
+    var v = null, ax = null, ay = null;
+
+    function snap() {
+      var o = { v0: v0, theta: theta, dt: dt, b: b, t: t, x: x, y: y, vx: vx, vy: vy };
+      if (v !== null) { o.v = v; o.ax = ax; o.ay = ay; }
+      o.xs = xs.slice(); o.ys = ys.slice();
+      return o;
+    }
+    function push(line) { steps.push({ line: line, out: out.length, vars: snap() }); }
+
+    push(1); push(2);
+    push(4); push(5); push(6); push(7);
+    push(9); push(10); push(11); push(12);
+
+    var guard = 0;
+    while (y >= 0 && guard++ < 400) {
+      push(14);
+      t += dt;                                push(15);
+      v = Math.hypot(vx, vy);                 push(16);
+      ax = -b * v * vx;                       push(17);
+      ay = -9.8 - b * v * vy;                 push(18);
+      vx += ax * dt;                          push(19);
+      vy += ay * dt;                          push(20);
+      x += vx * dt;                           push(21);
+      y += vy * dt;                           push(22);
+      xs.push(x);                             push(23);
+      ys.push(y);                             push(24);
+      push(25);                               /* plt.clf() */
+      /* plt.plot(...) -> the figure is stale, so a frame is captured */
+      frames.push({ step: steps.length, n: xs.length, t: t });
+      push(26);
+      out += 't = ' + t.toFixed(1).padStart(4) + ' s   y = ' + y.toFixed(2).padStart(6) + ' m\n';
+      push(27);
+    }
+    push(14);
+    push(29); push(30); push(31); push(32);
+    out += 'range: ' + x.toFixed(1) + ' m\n';
+    push(33);
+    steps.push({ line: null, out: out.length, vars: snap(), end: true });
+    return { steps: steps, frames: frames, output: out };
+  }
+
+  var REC = record();
+  var idx = Math.min(REC.frames.length ? REC.frames[Math.floor(REC.frames.length * 0.45)].step : 0,
+                     REC.steps.length - 1);
+  var bps = { 22: true };
+  var pinned = ['y'];
+  var view = 'result';
+  var SPEEDS = [0.2, 0.5, 1, 2, 4];
+  var speedI = 4;
+  var playing = false, timer = null;
+
+  var $ = function (id) { return document.getElementById(id); };
+
+  /* ---- static chrome: gutter + source --------------------------- */
+  function esc(s) { return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  var KW = /\b(import|as|while|from|print|def|return|if|else|for|in|and|or|not)\b/g;
+  function hl(line) {
+    var m = line.match(/^(.*?)(#.*)$/);
+    var code = m ? m[1] : line, comment = m ? m[2] : '';
+    var h = esc(code)
+      .replace(/(&quot;|")([^"]*)("|&quot;)/g, '<span class="s">$1$2$3</span>')
+      .replace(/\bf?"([^"]*)"/g, function (s) { return '<span class="s">' + s + '</span>'; })
+      .replace(KW, '<span class="k">$1</span>')
+      .replace(/\b(np|plt)\b/g, '<span class="f">$1</span>')
+      .replace(/(?<![\w.])(\d+\.?\d*)/g, '<span class="n">$1</span>');
+    return h + (comment ? '<span class="c">' + esc(comment) + '</span>' : '');
+  }
+  (function buildCode() {
+    var g = '', s = '';
+    for (var i = 0; i < SRC.length; i++) {
+      var n = i + 1;
+      g += '<div data-line="' + n + '" title="Toggle a breakpoint on line ' + n + '">' + n + '</div>';
+      s += '<div data-line="' + n + '">' + (SRC[i] === '' ? '&nbsp;' : hl(SRC[i])) + '</div>';
+    }
+    $('gutter').innerHTML = g;
+    $('src').innerHTML = s;
+  })();
+
+  /* ---- the plot -------------------------------------------------- */
+  var cv = $('plot'), cx = cv.getContext('2d');
+  function frameAt(step) {
+    var best = null;
+    for (var i = 0; i < REC.frames.length; i++) {
+      if (REC.frames[i].step <= step) best = REC.frames[i]; else break;
+    }
+    return best;
+  }
+  function drawPlot(step) {
+    var W = cv.width, H = cv.height, dpr = 2;
+    cx.save();
+    cx.clearRect(0, 0, W, H);
+    cx.fillStyle = '#ffffff'; cx.fillRect(0, 0, W, H);
+
+    var fr = frameAt(step);
+    var L = 96, R = W - 34, T = 56, B = H - 74;
+
+    var allX = REC.steps[REC.steps.length - 1].vars.xs;
+    var allY = REC.steps[REC.steps.length - 1].vars.ys;
+    var xmax = Math.max.apply(null, allX) * 1.04;
+    var ymax = Math.max.apply(null, allY) * 1.14;
+
+    function px(v) { return L + (v / xmax) * (R - L); }
+    function py(v) { return B - (v / ymax) * (B - T); }
+
+    /* faint grid + ticks on one scale */
+    cx.strokeStyle = '#ececec'; cx.lineWidth = 1 * dpr;
+    cx.fillStyle = '#555'; cx.font = (12 * dpr) + 'px "IBM Plex Mono", monospace';
+    var i, tk;
+    for (i = 0; i <= 5; i++) {
+      tk = (xmax / 5) * i;
+      cx.beginPath(); cx.moveTo(px(tk), T); cx.lineTo(px(tk), B); cx.stroke();
+      cx.textAlign = 'center'; cx.textBaseline = 'top';
+      cx.fillText(tk.toFixed(0), px(tk), B + 9 * dpr);
+    }
+    for (i = 0; i <= 4; i++) {
+      tk = (ymax / 4) * i;
+      cx.beginPath(); cx.moveTo(L, py(tk)); cx.lineTo(R, py(tk)); cx.stroke();
+      cx.textAlign = 'right'; cx.textBaseline = 'middle';
+      cx.fillText(tk.toFixed(0), L - 10 * dpr, py(tk));
+    }
+
+    /* spines */
+    cx.strokeStyle = '#8a8a8a'; cx.lineWidth = 1.4 * dpr;
+    cx.beginPath(); cx.moveTo(L, T); cx.lineTo(L, B); cx.lineTo(R, B); cx.stroke();
+
+    /* axis labels + title, in matplotlib's own idiom */
+    cx.fillStyle = '#141413';
+    cx.font = (14 * dpr) + 'px "IBM Plex Sans", sans-serif';
+    cx.textAlign = 'center'; cx.textBaseline = 'alphabetic';
+    cx.fillText('x (m)', (L + R) / 2, H - 22 * dpr);
+    cx.save();
+    cx.translate(26 * dpr, (T + B) / 2); cx.rotate(-Math.PI / 2);
+    cx.fillText('y (m)', 0, 0);
+    cx.restore();
+    cx.font = (15.5 * dpr) + 'px "IBM Plex Sans", sans-serif';
+    cx.fillText('projectile with linear drag', (L + R) / 2, T - 20 * dpr);
+
+    if (!fr) {
+      cx.fillStyle = '#b4b4b4';
+      cx.font = 'italic ' + (13 * dpr) + 'px "IBM Plex Sans", sans-serif';
+      cx.fillText('no frame captured yet', (L + R) / 2, (T + B) / 2);
+      cx.restore();
+      return;
+    }
+
+    /* the curve up to this frame */
+    var xsF = allX.slice(0, fr.n), ysF = allY.slice(0, fr.n);
+    cx.strokeStyle = '#2b6c9e'; cx.lineWidth = 2.6 * dpr;
+    cx.lineJoin = 'round'; cx.beginPath();
+    for (i = 0; i < xsF.length; i++) {
+      var X = px(xsF[i]), Y = py(Math.max(ysF[i], 0));
+      if (i === 0) cx.moveTo(X, Y); else cx.lineTo(X, Y);
+    }
+    cx.stroke();
+    /* emphasized endpoint */
+    cx.fillStyle = '#14435f';
+    cx.beginPath();
+    cx.arc(px(xsF[xsF.length - 1]), py(Math.max(ysF[ysF.length - 1], 0)), 4 * dpr, 0, 7);
+    cx.fill();
+
+    /* frame stamp */
+    cx.fillStyle = '#7b8b98';
+    cx.font = (11.5 * dpr) + 'px "IBM Plex Mono", monospace';
+    cx.textAlign = 'right'; cx.textBaseline = 'top';
+    cx.fillText('frame ' + (REC.frames.indexOf(fr) + 1) + '/' + REC.frames.length +
+                '   t = ' + fr.t.toFixed(1) + ' s', R, T - 14 * dpr);
+    cx.restore();
+  }
+
+  /* ---- variables ------------------------------------------------- */
+  var ORDER = ['t', 'x', 'y', 'vx', 'vy', 'v', 'ax', 'ay', 'xs', 'ys', 'v0', 'theta', 'dt', 'b'];
+  function typeOf(k, val) { return Array.isArray(val) ? 'list' : 'float'; }
+  function reprOf(val) {
+    if (Array.isArray(val)) {
+      var parts = val.map(function (n) { return f(n, 3); });
+      var s = '[' + parts.join(', ') + ']';
+      return s.length > 118 ? s.slice(0, 115) + '…]' : s;
+    }
+    return String(f(val, 4));
+  }
+  function varsAt(step) {
+    var vs = REC.steps[step].vars, rows = [];
+    ORDER.forEach(function (k) {
+      if (!(k in vs)) return;
+      rows.push({ name: k, type: typeOf(k, vs[k]), repr: reprOf(vs[k]),
+                  len: Array.isArray(vs[k]) ? vs[k].length : null });
+    });
+    rows.sort(function (a, b) {
+      var pa = pinned.indexOf(a.name) >= 0 ? 0 : 1, pb = pinned.indexOf(b.name) >= 0 ? 0 : 1;
+      return pa - pb;
+    });
+    return rows;
+  }
+  var CLIP = '<svg width="12" height="12" viewBox="0 0 16 16" aria-hidden="true">' +
+    '<path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" ' +
+    'd="M11.4 5.1L6.2 10.3a2 2 0 002.9 2.9l5.1-5.2a3.6 3.6 0 00-5.1-5.1L3.4 8.6a5.2 5.2 0 007.3 7.3"/></svg>';
+
+  function paintVars() {
+    var rows = varsAt(idx);
+    var prev = idx > 0 ? REC.steps[idx - 1].vars : null;
+    var html = '';
+    rows.forEach(function (r) {
+      var isPin = pinned.indexOf(r.name) >= 0;
+      var changed = prev && (!(r.name in prev) || reprOf(prev[r.name]) !== r.repr);
+      html += '<tr class="' + (isPin ? 'pinned ' : '') + (changed ? 'changed' : '') + '">' +
+        '<td class="clip"><button class="clipbtn' + (isPin ? ' on' : '') + '" data-pin="' + r.name +
+        '" aria-pressed="' + isPin + '" title="' + (isPin ? 'Unpin' : 'Pin') + ' ' + r.name + '">' + CLIP + '</button></td>' +
+        '<td class="nm">' + r.name + '</td>' +
+        '<td class="ty">' + r.type + (r.len !== null ? ' <span class="len">(' + r.len + ')</span>' : '') + '</td>' +
+        '<td class="vl">' + esc(r.repr) + '</td></tr>';
+    });
+    $('varsBody').innerHTML = html;
+    $('varCount').textContent = '(' + rows.length + ')';
+  }
+
+  /* ---- watch window --------------------------------------------- */
+  function seriesFor(name) {
+    var out = [];
+    for (var i = 0; i < REC.steps.length; i++) {
+      var vs = REC.steps[i].vars;
+      out.push(name in vs && !Array.isArray(vs[name]) ? vs[name] : null);
+    }
+    return out;
+  }
+  function paintWatch() {
+    var host = $('watchRows');
+    if (!pinned.length) {
+      host.innerHTML = '<p class="empty">Nothing pinned yet. Open <b>Variables</b> and click a paperclip.</p>';
+      $('watchHint').textContent = 'click a paperclip in Variables to pin';
+      return;
+    }
+    $('watchHint').textContent = pinned.length + ' pinned · click a trace to jump';
+    var html = '';
+    pinned.forEach(function (name) {
+      var ser = seriesFor(name);
+      var vs = REC.steps[idx].vars;
+      var here = (name in vs) && !Array.isArray(vs[name]);
+      var lo = Infinity, hi = -Infinity, any = false;
+      ser.forEach(function (v) { if (v !== null) { any = true; if (v < lo) lo = v; if (v > hi) hi = v; } });
+      var W = 118, H = 20, path = '', gap = '';
+      if (any) {
+        var span = (hi - lo) || 1, started = false;
+        for (var i = 0; i < ser.length; i++) {
+          var X = (i / (ser.length - 1)) * W;
+          if (ser[i] === null) { started = false; continue; }
+          var Y = H - 2 - ((ser[i] - lo) / span) * (H - 4);
+          path += (started ? 'L' : 'M') + X.toFixed(1) + ' ' + Y.toFixed(1) + ' ';
+          started = true;
+        }
+        var cxp = (idx / (ser.length - 1)) * W;
+        gap = '<line x1="' + cxp.toFixed(1) + '" y1="0" x2="' + cxp.toFixed(1) + '" y2="' + H +
+              '" stroke="#a94442" stroke-width="1"/>';
+      }
+      html += '<div class="wrow">' +
+        '<span class="wn">' + name + '</span>' +
+        '<span class="wv' + (here ? '' : ' undef') + '">' + (here ? f(vs[name], 3) : 'not defined') + '</span>' +
+        '<svg class="spark" viewBox="0 0 ' + W + ' ' + H + '" data-spark="' + name +
+        '" preserveAspectRatio="none" role="img" aria-label="' + name + ' across the run">' +
+        '<rect x="0" y="0" width="' + W + '" height="' + H + '" fill="#f7fafc"/>' +
+        '<path d="' + path + '" fill="none" stroke="#2b6c9e" stroke-width="1.3"/>' + gap + '</svg>' +
+        '<button class="unpin" data-pin="' + name + '" title="Unpin ' + name + '">' +
+        '<svg width="10" height="10" viewBox="0 0 16 16" aria-hidden="true"><path fill="currentColor" ' +
+        'd="M13 4.2L11.8 3 8 6.8 4.2 3 3 4.2 6.8 8 3 11.8 4.2 13 8 9.2 11.8 13 13 11.8 9.2 8z"/></svg>' +
+        '</button></div>';
+    });
+    host.innerHTML = html;
+  }
+
+  /* ---- the one render entry point -------------------------------- */
+  function render() {
+    var st = REC.steps[idx];
+    var last = REC.steps.length - 1;
+
+    $('slider').max = last;
+    $('slider').value = idx;
+    $('pos').textContent = st.end ? 'end' : (idx + 1) + ' / ' + last;
+
+    var lines = $('src').children, gut = $('gutter').children, i;
+    for (i = 0; i < lines.length; i++) {
+      lines[i].classList.toggle('cur', st.line === i + 1);
+      gut[i].classList.toggle('bp', !!bps[i + 1]);
+    }
+
+    $('console').textContent = REC.output.slice(0, st.out);
+    $('console').scrollTop = $('console').scrollHeight;
+
+    drawPlot(idx);
+    paintVars();
+    paintWatch();
+    $('liveTag').textContent = 'recording loaded · ' + REC.frames.length + ' frames · ' +
+                               (REC.steps.length - 1) + ' steps';
+  }
+
+  function goto(n) {
+    idx = Math.max(0, Math.min(n, REC.steps.length - 1));
+    render();
+  }
+
+  /* ---- controls --------------------------------------------------- */
+  function stopPlay() {
+    playing = false;
+    if (timer) { clearInterval(timer); timer = null; }
+    $('bPlay').setAttribute('aria-pressed', 'false');
+    $('playIcon').innerHTML = '<path fill="currentColor" d="M3 2l11 6-11 6z"/>';
+  }
+  function startPlay() {
+    if (idx >= REC.steps.length - 1) idx = 0;
+    playing = true;
+    $('bPlay').setAttribute('aria-pressed', 'true');
+    $('playIcon').innerHTML = '<path fill="currentColor" d="M3 2h4v12H3zM9 2h4v12H9z"/>';
+    timer = setInterval(function () {
+      if (idx >= REC.steps.length - 1) { stopPlay(); render(); return; }
+      goto(idx + 1);
+    }, 1000 / SPEEDS[speedI]);
+  }
+
+  $('bFirst').onclick = function () { stopPlay(); goto(0); };
+  $('bBack').onclick  = function () { stopPlay(); goto(idx - 1); };
+  $('bFwd').onclick   = function () { stopPlay(); goto(idx + 1); };
+  $('bLast').onclick  = function () { stopPlay(); goto(REC.steps.length - 1); };
+  $('bExit').onclick  = function () { stopPlay(); goto(0); $('pill').classList.remove('open');
+                                      $('toggle').setAttribute('aria-expanded', 'false'); };
+  $('slider').oninput = function () { stopPlay(); goto(parseInt(this.value, 10) || 0); };
+  $('bPlay').onclick  = function () { playing ? stopPlay() : startPlay(); };
+  $('bSpeed').onclick = function () {
+    speedI = (speedI + 1) % SPEEDS.length;
+    var s = SPEEDS[speedI];
+    this.textContent = (s < 1 ? '1/' + Math.round(1 / s) : s) + '/s';
+    if (playing) { stopPlay(); startPlay(); }
+  };
+  $('bWatch').onclick = function () {
+    var on = $('watch').classList.toggle('shown');
+    this.setAttribute('aria-pressed', String(on));
+  };
+  $('toggle').onclick = function () {
+    var on = $('pill').classList.toggle('open');
+    this.setAttribute('aria-expanded', String(on));
+  };
+
+  function jumpBp(dir) {
+    stopPlay();
+    for (var i = idx + dir; i >= 0 && i < REC.steps.length; i += dir) {
+      if (REC.steps[i].line && bps[REC.steps[i].line]) { goto(i); return; }
+    }
+  }
+  $('bPrevBp').onclick = function () { jumpBp(-1); };
+  $('bNextBp').onclick = function () { jumpBp(1); };
+
+  $('gutter').onclick = function (e) {
+    var d = e.target.closest('[data-line]'); if (!d) return;
+    var n = parseInt(d.getAttribute('data-line'), 10);
+    if (bps[n]) delete bps[n]; else bps[n] = true;
+    render();
+  };
+
+  function togglePin(name) {
+    var at = pinned.indexOf(name);
+    if (at >= 0) pinned.splice(at, 1); else pinned.push(name);
+    render();
+  }
+  $('varsBody').onclick = function (e) {
+    var b = e.target.closest('[data-pin]'); if (b) togglePin(b.getAttribute('data-pin'));
+  };
+  $('watchRows').onclick = function (e) {
+    var b = e.target.closest('button[data-pin]');
+    if (b) { togglePin(b.getAttribute('data-pin')); return; }
+    var sp = e.target.closest('[data-spark]');
+    if (sp) {
+      var r = sp.getBoundingClientRect();
+      stopPlay();
+      goto(Math.round(((e.clientX - r.left) / r.width) * (REC.steps.length - 1)));
+    }
+  };
+
+  /* output tabs */
+  function setView(v) {
+    view = v;
+    $('tabResult').classList.toggle('active', v === 'result');
+    $('tabVars').classList.toggle('active', v === 'vars');
+    $('graphic').hidden = v !== 'result';
+    $('varsView').hidden = v !== 'vars';
+  }
+  $('tabResult').onclick = function () { setView('result'); };
+  $('tabVars').onclick = function () { setView('vars'); };
+  $('runBtn').onclick = function () { stopPlay(); setView('result'); goto(0); };
+
+  /* keyboard: only while the panel has focus, which is the real question */
+  $('pill').addEventListener('keydown', function (e) {
+    var dir = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0;
+    if (!dir) return;
+    e.preventDefault(); stopPlay();
+    if (e.shiftKey) jumpBp(dir); else goto(idx + dir);
+  });
+
+  /* ---- dragging by the grip -------------------------------------- */
+  (function drag() {
+    var pill = $('pill'), layer = $('layer'), grip = $('grip');
+    var down = null;
+    function start(cx0, cy0) {
+      var pr = pill.getBoundingClientRect(), lr = layer.getBoundingClientRect();
+      down = { dx: cx0 - pr.left, dy: cy0 - pr.top, lr: lr };
+      pill.classList.add('dragging');
+    }
+    function move(cx0, cy0) {
+      if (!down) return;
+      var w = pill.offsetWidth, h = pill.offsetHeight;
+      var left = cx0 - down.lr.left - down.dx;
+      var top = cy0 - down.lr.top - down.dy;
+      left = Math.max(4, Math.min(left, down.lr.width - w - 4));
+      top = Math.max(4, Math.min(top, down.lr.height - h - 4));
+      pill.style.left = left + 'px';
+      pill.style.top = top + 'px';
+    }
+    function end() { down = null; pill.classList.remove('dragging'); }
+
+    grip.addEventListener('pointerdown', function (e) {
+      e.preventDefault(); grip.setPointerCapture(e.pointerId); start(e.clientX, e.clientY);
+    });
+    grip.addEventListener('pointermove', function (e) { if (down) move(e.clientX, e.clientY); });
+    grip.addEventListener('pointerup', end);
+    grip.addEventListener('pointercancel', end);
+    grip.addEventListener('keydown', function (e) {
+      var step = 8, cur = { l: parseFloat(pill.style.left) || 0, t: parseFloat(pill.style.top) || 0 };
+      var map = { ArrowLeft: [-step, 0], ArrowRight: [step, 0], ArrowUp: [0, -step], ArrowDown: [0, step] };
+      if (!map[e.key]) return;
+      e.preventDefault(); e.stopPropagation();
+      var lr = layer.getBoundingClientRect();
+      pill.style.left = Math.max(4, Math.min(cur.l + map[e.key][0], lr.width - pill.offsetWidth - 4)) + 'px';
+      pill.style.top = Math.max(4, Math.min(cur.t + map[e.key][1], lr.height - pill.offsetHeight - 4)) + 'px';
+    });
+  })();
+
+  /* size the canvas to its pane, once, at a retina-ish density */
+  (function sizePlot() {
+    var pane = $('graphic');
+    var w = Math.max(360, pane.clientWidth - 12), h = Math.max(240, pane.clientHeight - 12);
+    cv.width = Math.round(w * 2); cv.height = Math.round(h * 2);
+    cv.style.width = w + 'px'; cv.style.height = h + 'px';
+  })();
+
+  render();
+})();
+</script>

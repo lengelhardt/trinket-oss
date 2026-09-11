@@ -1723,6 +1723,23 @@ function stepDebuggerEnabled() {
     && !!(window.trinket && window.trinket.config && window.trinket.config.stepDebugger);
 }
 
+// The floating panel (public/js/plugins/debug-panel.js) is a view over the
+// state below and owns none of it. Requires stepDebugger, because it drives
+// that debugger's own functions.
+function debugPanelEnabled() {
+  return stepDebuggerEnabled()
+    && !!(window.trinket && window.trinket.config && window.trinket.config.debugPanel);
+}
+
+// Tell the panel the debugger's state moved. Called from every place that
+// already repaints the in-tab controls, so the two views cannot disagree.
+// A no-op when the flag is off, and guarded so a panel bug can never break
+// stepping -- the in-tab controls stay authoritative.
+function debugPanelSync() {
+  if (!window.trinketDebugPanel) return;
+  try { trinketDebugPanel.sync(); } catch (e) {}
+}
+
 // Recorder caps (see the MVP doc). The step/size caps abort the traced exec
 // from INSIDE the tracer — that's what bounds `while True:` on the main
 // thread, where JS cannot interrupt synchronous Python.
@@ -1731,10 +1748,26 @@ var DEBUG_MAX_VARS = 50;
 var DEBUG_MAX_REPR = 120;
 var DEBUG_MAX_DEPTH = 20;
 var DEBUG_MAX_BYTES = 2 * 1024 * 1024;
-// Phase 3: with breakpoints set the tracer idles (no snapshots) until one is
-// hit — but an infinite loop BEFORE the first breakpoint would otherwise spin
-// forever, so dormant line events are capped too (cheap: a set lookup each).
+// Output shares DEBUG_MAX_BYTES with steps and snapshots rather than getting a
+// second full allowance. This is the floor it keeps even when they spent the
+// lot: a program whose recording filled the budget should still show what it
+// printed, because that is the half the student can read.
+var DEBUG_MIN_OUTPUT_BYTES = 64 * 1024;
+// OPT-IN deferred recording (see debugRunDeferred). Only reachable from the
+// button the panel offers after a recording truncated before reaching the
+// student's breakpoint -- never automatic, which is the whole difference from
+// the version deleted in 21488d9.
+//
+// DEBUG_MAX_DORMANT bounds the coast: without it a `while True:` ABOVE the
+// breakpoint spins forever, because nothing accumulates in _steps to trip the
+// step cap. Restored at its original value.
 var DEBUG_MAX_DORMANT = 200000;
+// How many steps before the breakpoint the coast keeps, so replay opens with
+// context rather than cold on the marked line. A ring buffer, so the cost is
+// bounded no matter how long the coast is; fewer than this simply keeps what
+// exists. 100 is ~14 turns of a six-line loop body -- enough to see the
+// rhythm and the variable trend leading in.
+var DEBUG_LOOKBACK_STEPS = 100;
 
 // The user program is compiled with filename '<debug>' and exec'd in a fresh
 // namespace: user frames are exactly the '<debug>' frames (functions defined in
@@ -1744,34 +1777,177 @@ var DEBUG_MAX_DORMANT = 200000;
 // step (full output, final globals) is appended so students can step past the
 // last line to the terminal state.
 var RECORD_HELPER = [
-  'import sys, json, types, io, traceback',
+  'import sys, json, types, io, traceback, reprlib, collections',
   // KEEP IN SYNC with VARS_HELPER's _SKIP + filters (the live explorer): both
   // must hide the same runner-injected names. They live in separate helper
   // strings/namespaces, so a shared definition would add more machinery than
   // it removes — this cross-reference is the guard.
   "_SKIP = {'__user_source__', '__trinket_echo_source__', '_plt', '_vpy', '_js_scene', '_wrapped_rate', 'transform_source'}",
-  'class _TrinketStopRecording(Exception): pass',
+  // BaseException, not Exception, and this is the guard that bounds a runaway
+  // program. A trace function's exception propagates into the frame being
+  // traced, so it meets that frame's own handlers -- and `try: ... except
+  // Exception:` inside a student's loop SWALLOWED the cap abort. Verified in a
+  // real interpreter: tracing then dies and the loop runs on untraced, so a
+  // `while True:` hangs the tab with no recording and nothing JS can interrupt,
+  // while _buf keeps growing with both size counters frozen. The `except
+  // _TrinketStopRecording` clause below still precedes `except BaseException`,
+  // so nothing else changes. A bare `except:` still swallows it; there is no
+  // defence against that and it is much rarer student code.
+  'class _TrinketStopRecording(BaseException): pass',
   '_steps = []',
   '_snaps = []',
-  '_size = [0]',
+  // Encoded cost, split in two because they are budgeted differently.
+  // _nsize is what the RECORDING (steps + snaps) will occupy once
+  // json.dumps has escaped it; _osize is stdout/stderr growth. Keeping them
+  // apart is what stops the output allowance below from subtracting output
+  // from its own budget -- the double-subtract in #274, which cost a
+  // mid-program print 60% of its bytes while a final-line print kept 100%.
+  // Seeded with the envelope -- the payload's own keys and braces, which are
+  // emitted whatever the program does. Measured: the empty payload
+  // `{"error": null, ... "steps": [], "snaps": []}` encodes to 135 bytes, and
+  // every varying field in it (_err, the flags, the two arrays) is charged
+  // separately below. Without this the bound is short by the wrapper, which is
+  // the difference between a bound and an estimate -- the complaint in #274.
+  '_nsize = [135]',
+  '_osize = [0]',
+  // Charged as `len(json.dumps(x)) + 2` -- the encoded object plus its
+  // separator in the enclosing array. TWO, not one: json.dumps defaults to
+  // `', '` WITH the space, so for N elements the array is
+  // 2 + sum(len(dumps(e))) + 2*(N-1) and charging len(dumps(e)) + 2 per
+  // element accounts for it exactly, brackets included. Charging +1 leaves the
+  // bound ~0.1% short, which is enough to exceed the cap -- verified, and it
+  // is the mistake that made this the fourth wrong version of this bound.
+  // The constants this replaces (+24 per variable, +40 per step) under-counted
+  // far worse: an empty variable entry encodes to 36 bytes, an empty step dict
+  // to 100.
+  'def _cost(_x):',
+  '    try:',
+  '        return len(json.dumps(_x)) + 2',
+  '    except Exception:',
+  '        return 2',
   '_truncated = [False]',
+  // Deferred-recording state. _ring holds up to _lookback (step, snap, cost)
+  // triples while coasting; _coasted counts every coasted line event; _kept
+  // and _skipped are what the ring retained and dropped when the breakpoint
+  // finally fired, so the UI can say both numbers honestly.
+  '_ring = collections.deque()',
+  '_coasted = [0]',
+  '_kept = [0]',
+  '_skipped = [0]',
   '_buf = io.StringIO()',
   '_last_out = [0]',
-  'def _snap_ns(_ns):',
+  // Names a library put in the namespace, tracked as execution goes so that
+  // _snap_ns can drop them BEFORE the per-step cap applies. That ordering is
+  // the whole point: _ns.items() runs in insertion order and _snap_ns stops at
+  // _max_vars, so `from sympy import *` fills all fifty slots with sympy
+  // before the student's own two variables are ever reached -- filtering
+  // afterwards, in JS, then leaves nothing at all.
+  //
+  // A `line` event fires BEFORE its line runs, so anything that appeared since
+  // the last event was bound by the PREVIOUS line. If that line was an import,
+  // the new names are library furniture. No blocklist, and it covers
+  // `import x`, `from x import y` and `from x import *` alike.
+  '_src_lines = _user_source.split(chr(10))',
+  // name -> id() of the object the import bound. A bare SET of names hid any
+  // later variable that reused the name: `from math import pi` then `pi = 3.14`
+  // at top level, or a function-local `e = sum(data)` after `from math import
+  // *`, vanished from the panel entirely. Identity distinguishes the imported
+  // object from a rebinding; the depth gate below covers the rest.
+  '_imported = {}',
+  '_seen = set()',
+  '_prev_line = [0]',
+  '_ns_len = [-1]',
+  'def _is_import_line(_n):',
+  '    if _n <= 0 or _n > len(_src_lines): return False',
+  '    _t = _src_lines[_n - 1].lstrip()',
+  "    if _t.startswith('import '): return True",
+  "    return _t.startswith('from ') and ' import' in _t",
+  'def _note_new(_ns):',
+  '    if len(_ns) == _ns_len[0]: return',
+  '    _ns_len[0] = len(_ns)',
+  '    _new = set(_ns.keys()) - _seen',
+  '    if _new:',
+  '        if _is_import_line(_prev_line[0]):',
+  '            for _n in _new: _imported[_n] = id(_ns[_n])',
+  '        _seen.update(_new)',
+  // A PRECONFIGURED reprlib.Repr for the containers it specialises, and the
+  // builtin repr() for everything else. This is the single biggest cost in the
+  // recorder, because it runs for every variable on every line event.
+  //
+  // builtins.repr() builds the ENTIRE string and the clamp below then throws
+  // all but 120 characters away -- so a list the student appends to in a loop
+  // costs more on every iteration and per-event cost climbs without bound.
+  // reprlib recurses into at most maxlist elements, so cost is FLAT. Measured
+  // in this embed on one list:
+  //        500 elements   builtin  175 us   reprlib  43 us
+  //      5 000 elements   builtin 1375 us   reprlib  35 us
+  //     20 000 elements   builtin 4305 us   reprlib  24 us
+  // and 14x end to end over 2000 appends of a growing list.
+  //
+  // maxlist 30 is chosen so nothing that used to fit in 120 characters stops
+  // fitting: ~30 short ints is the most that ever did. Verified against the
+  // old output on a 30-tuple, a 25-int list, 12 floats and a string list --
+  // byte-identical. Where it does differ it is BETTER: it closes the bracket
+  // instead of cutting a float in half, and it keeps a string's closing quote.
+  //
+  // GATED ON TYPE, and that matters. reprlib's repr_instance fallback calls
+  // builtins.repr() anyway, so it buys no speed off the container types -- and
+  // it elides the MIDDLE of the result, which mangles a repr that already
+  // summarises itself. numpy is the case: it self-summarises above
+  // threshold=1000, so it was never the expensive one, and routing it through
+  // reprlib turned a clean array([...]) into 'array([0.0, 2.0e-04, ......e-01'
+  // and cut across its row breaks. With the gate, numpy output is unchanged.
+  // EXACT TYPE, not isinstance, and no dict. Two separate corrections.
+  //
+  // isinstance let SUBCLASSES through, but reprlib.repr1 dispatches on
+  // type(x).__name__ -- so a namedtuple ('State') or a defaultdict found no
+  // repr_State/repr_defaultdict and landed in repr_instance, which builds the
+  // whole repr anyway and then elides its MIDDLE. That is the same mid-token
+  // cut across a value's own structure that numpy is gated out to avoid, with
+  // none of the speed. `State = namedtuple('State', 'x y vx vy')` is ordinary
+  // code in this audience. type() in (...) sends every subclass back to plain
+  // repr() plus the head clamp, i.e. byte-identical to before.
+  //
+  // dict is out because reprlib.repr_dict SORTS the keys before slicing them,
+  // so display order flipped from insertion to alphabetical AND the survivors
+  // were the alphabetically-first maxdict rather than the first the student
+  // wrote. print() and the live variable explorer both still use plain repr,
+  // so the same dict would have read one way in the Variables tab and another
+  // while stepping. Dicts were never the case this was chasing either -- that
+  // was the bare accumulator list. (A dict NESTED inside a gated list still
+  // takes repr_dict via recursion; at that depth the 120-char clamp was
+  // already cutting it, so the difference is marginal.)
+  "_RL_TYPES = (list, tuple, set, frozenset, str)",
+  '_rl = reprlib.Repr()',
+  '_rl.maxlevel = 4',
+  '_rl.maxlist = _rl.maxtuple = _rl.maxset = _rl.maxfrozenset = _rl.maxdeque = 30',
+  '_rl.maxstring = _max_repr',
+  '_rl.maxother = _max_repr',
+  // `_top` is whether this namespace IS the module frame. _imported is built
+  // from module-level import lines only, so applying it to a function's
+  // f_locals hid any local sharing a name with an import -- and identity
+  // alone would not catch `def f(): pi = math.pi`, where the local is bound
+  // to the very object the import named.
+  'def _snap_ns(_ns, _top=True):',
   '    _out = []',
   '    for _name, _val in list(_ns.items()):',
   '        if _name in _SKIP: continue',
+  '        if _top and _imported.get(_name, -1) == id(_val): continue',
   "        if _name.startswith('__') and _name.endswith('__'): continue",
   '        if isinstance(_val, types.ModuleType): continue',
   '        if isinstance(_val, (types.FunctionType, types.BuiltinFunctionType, types.LambdaType)): continue',
   '        if isinstance(_val, type): continue',
   '        try:',
-  '            _r = repr(_val)',
+  '            _r = _rl.repr(_val) if type(_val) in _RL_TYPES else repr(_val)',
   '        except Exception:',
   "            _r = '<unrepresentable>'",
   "        if len(_r) > _max_repr: _r = _r[:_max_repr] + '...'",
-  "        _out.append({'name': _name, 'type': type(_val).__name__, 'repr': _r})",
-  '        _size[0] += len(_r) + len(_name) + 24',
+  // The type name was written into every entry, charged nothing, and left
+  // unclamped -- a class with a pathological __name__ was unbounded. Same
+  // clamp as the repr.
+  '        _tn = type(_val).__name__',
+  '        if len(_tn) > _max_repr: _tn = _tn[:_max_repr] + \'...\'',
+  "        _out.append({'name': _name, 'type': _tn, 'repr': _r})",
   '        if len(_out) >= _max_vars: break',
   '    return _out',
   // Phase 2: trace the main file AND user modules imported from the Pyodide FS
@@ -1799,16 +1975,33 @@ var RECORD_HELPER = [
   '            return _f.f_lineno, _file_label(_f.f_code.co_filename)',
   '        _f = _f.f_back',
   '    return None, None',
-  // Phase 3: deferred recording. With breakpoints set, stay dormant (no
-  // snapshots, no step cap) until execution first touches a breakpoint line —
-  // long preambles don't burn the cap. Dormant line events are still counted
-  // and capped so an infinite loop BEFORE any breakpoint can't spin forever.
+  // Breakpoints do NOT gate recording. They used to: with any breakpoint set
+  // the tracer stayed dormant -- no snapshots at all -- until execution first
+  // touched a breakpoint line, so the steps before it did not exist and the
+  // replay opened AT the breakpoint. That is the opposite of what a breakpoint
+  // means everywhere else, and it also made a whole class of failure: an
+  // orphaned breakpoint (a file renamed or deleted, or a dot on a line that
+  // never runs) could never be hit, so every recording for the rest of the
+  // page session came back empty. The recording now always starts at the
+  // program's first line and _bp_set only reports whether a breakpoint was
+  // ever reached; auto mode is what stops there.
+  //
+  // The one deleted `return _tracer` in the old else-arm WAS the whole bug.
+  //
+  // Losing the dormant cap loses no protection: it bounded a hazard the
+  // dormant branch itself created (a loop spinning while no steps accumulate,
+  // so the step cap could never trip). With every line event recorded, the
+  // cap check below is reached from the first event of every run, and
+  // the bound is strictly tighter than before -- 5000 steps or 2 MB, rather
+  // than 200,000 dormant events PLUS 5000 recorded ones.
   '_bp_set = set()',
   'for _k in _bp:',
   '    for _l in _bp[_k]:',
   '        _bp_set.add((_k, _l))',
-  '_armed = [not _bp_set]',
-  '_dormant = [0]',
+  // "has a breakpoint line actually executed", not "has recording started".
+  // The initializer is already right for that meaning: True (nothing to
+  // report) when no breakpoints are set, False until one is hit when there are.
+  '_hit = [not _bp_set]',
   'def _tracer(_frame, _event, _arg):',
   '    if not _is_user(_frame.f_code.co_filename):',
   '        return None',
@@ -1819,29 +2012,80 @@ var RECORD_HELPER = [
   '        return _tracer',
   // The byte cap must bound the WHOLE payload, not just snapshot reprs: count
   // stdout growth since the last event (a single huge print would otherwise
-  // sail past the cap into a multi-MB JSON). Counted in the dormant phase too —
-  // pre-breakpoint prints still ship in the recording's output.
-  '    _size[0] += _buf.tell() - _last_out[0]',
+  // sail past the cap into a multi-MB JSON). Unconditional: every line event
+  // is recorded now, so every byte of stdout lands in the accounting.
+  // Raw character growth, not encoded: json.dumps on the whole buffer at
+  // every line event would be O(n^2) in the hot path. This is a tripwire for
+  // runaway output, and the exact encoded bound is enforced by the clamp at
+  // the end, which does measure json.dumps.
+  '    _osize[0] += _buf.tell() - _last_out[0]',
   '    _last_out[0] = _buf.tell()',
-  '    if not _armed[0]:',
+  // Import attribution and the depth are needed by BOTH paths below, so they
+  // run before either. _note_new only updates _seen/_imported, so running it
+  // once more on an event that then aborts is harmless.
+  '    _d = _depth_of(_frame)',
+  '    if _d == 0:',
+  '        _note_new(_frame.f_locals)',
+  // Has a marked line executed yet? On the event where it first does, the
+  // deferred run ARMS: the lookback window is flushed into the recording and
+  // this same event then falls through and is recorded normally. So replay
+  // opens _lookback steps BEFORE the marked line, not on it.
+  '    if not _hit[0]:',
   "        _lbl = _file_label(_frame.f_code.co_filename) or '<main>'",
   '        if (_lbl, _frame.f_lineno) in _bp_set:',
-  '            _armed[0] = True',
-  '        else:',
-  '            _dormant[0] += 1',
-  '            if _dormant[0] > _max_dormant or _size[0] > _max_bytes:',
-  '                _truncated[0] = True',
-  '                raise _TrinketStopRecording()',
-  '            return _tracer',
-  // Armed path: per-step dict overhead joins the accounting.
-  '    _size[0] += 40',
-  '    if len(_steps) >= _max_steps or _size[0] > _max_bytes:',
+  '            _hit[0] = True',
+  '            _kept[0] = len(_ring)',
+  '            _skipped[0] = _coasted[0] - _kept[0]',
+  '            while _ring:',
+  '                _e = _ring.popleft()',
+  '                _steps.append(_e[0])',
+  '                _snaps.append(_e[1])',
+  // THE COAST. Only ever entered when the student asked for it by pressing
+  // the panel's "record from the breakpoint instead" button; _defer is false
+  // for every ordinary recording, so this whole branch is dead weight on the
+  // normal path (one boolean test).
+  //
+  // The window is a ring, so the work is bounded: build the step and its
+  // snapshot as usual, then drop the oldest once the window is full. The byte
+  // cap MUST be credited back on eviction -- charge without crediting and a
+  // long coast trips the 2 MB cap before the breakpoint ever fires, which is
+  // precisely the failure this feature exists to prevent. _cost is exactly
+  // what this step added to _size, and stdout growth is charged above _pre so
+  // it is never credited back: the output is kept whole either way.
+  '    if _defer and not _hit[0]:',
+  '        _fl, _ff = _call_site(_frame) if _d > 0 else (None, None)',
+  "        _st = {'line': _frame.f_lineno, 'func': _frame.f_code.co_name, 'depth': _d, 'out': _buf.tell(), 'file': _file_label(_frame.f_code.co_filename), 'from_line': _fl, 'from_file': _ff}",
+  '        _sn = _snap_ns(_frame.f_locals, _d == 0)',
+  '        _c = _cost(_st) + _cost(_sn)',
+  '        _nsize[0] += _c',
+  '        _ring.append((_st, _sn, _c))',
+  '        while len(_ring) > _lookback:',
+  '            _nsize[0] -= _ring.popleft()[2]',
+  '        _coasted[0] += 1',
+  '        _prev_line[0] = _frame.f_lineno if _d == 0 else _prev_line[0]',
+  // Give up rather than coast forever. Reaching either bound leaves _hit
+  // false, which the host reports as "that line never ran".
+  '        if _coasted[0] > _max_dormant or _nsize[0] + _osize[0] > _max_bytes:',
+  '            _truncated[0] = True',
+  '            raise _TrinketStopRecording()',
+  '        return _tracer',
+  // Build the step and its snapshot BEFORE the cap check, so the charge is
+  // what this step actually encodes to -- and so the step that trips the cap
+  // is not appended. Charging a flat estimate first and appending afterwards
+  // is how the bound drifted from the payload.
+  '    if len(_steps) >= _max_steps:',
   '        _truncated[0] = True',
   '        raise _TrinketStopRecording()',
-  '    _d = _depth_of(_frame)',
   '    _fl, _ff = _call_site(_frame) if _d > 0 else (None, None)',
-  "    _steps.append({'line': _frame.f_lineno, 'func': _frame.f_code.co_name, 'depth': _d, 'out': _buf.tell(), 'file': _file_label(_frame.f_code.co_filename), 'from_line': _fl, 'from_file': _ff})",
-  '    _snaps.append(_snap_ns(_frame.f_locals))',
+  "    _st = {'line': _frame.f_lineno, 'func': _frame.f_code.co_name, 'depth': _d, 'out': _buf.tell(), 'file': _file_label(_frame.f_code.co_filename), 'from_line': _fl, 'from_file': _ff}",
+  '    _sn = _snap_ns(_frame.f_locals, _d == 0)',
+  '    _nsize[0] += _cost(_st) + _cost(_sn)',
+  '    if _nsize[0] + _osize[0] > _max_bytes:',
+  '        _truncated[0] = True',
+  '        raise _TrinketStopRecording()',
+  '    _steps.append(_st)',
+  '    _snaps.append(_sn)',
+  '    _prev_line[0] = _frame.f_lineno if _d == 0 else _prev_line[0]',
   '    return _tracer',
   "_g = {'__name__': '__main__'}",
   '_err = None',
@@ -1859,17 +2103,92 @@ var RECORD_HELPER = [
   '    pass',
   'except BaseException as _e:',
   "    _err = ''.join(traceback.format_exception_only(type(_e), _e)).strip()",
+  // format_exception_only embeds the exception's full str(), and NOTHING
+  // charges _err against the byte estimate -- so the cap cannot engage at all
+  // here. `xs = list(range(300000)); assert len(xs) == 0, xs` measured a
+  // 2.18 MiB payload from THREE recorded steps, essentially all of it this
+  // string; `float('x' * 3_000_000)` measured 2.86 MiB. Both are things a
+  // student writes to "see" their data. 2000 characters is generous even in
+  // CJK, where it is still only ~12 KB encoded.
+  '    if len(_err) > 2000:',
+  "        _err = _err[:2000] + ' ... (error message truncated)'",
+  // Charged for the same reason as the envelope: it is in the payload. The
+  // clamp above bounds it to 2000 chars, but escaping can take that past 2 KB.
+  '    _nsize[0] += _cost(_err)',
   'finally:',
   '    sys.stdout, sys.stderr = _old_out, _old_err',
-  "_steps.append({'line': None, 'func': '<end>', 'depth': 0, 'out': _buf.tell(), 'file': None, 'from_line': None, 'from_file': None})",
-  '_snaps.append(_snap_ns(_g))',
-  "json.dumps({'error': _err, 'truncated': _truncated[0], 'armed': _armed[0], 'skipped': _dormant[0], 'output': _buf.getvalue(), 'steps': _steps, 'snaps': _snaps})"
+  // The synthetic <end> step and the final globals snapshot go into the
+  // payload like any other, so they are charged like any other -- otherwise
+  // the output allowance below is computed against a _nsize that is short by
+  // a whole snapshot, which on a 50-variable program is not a rounding error.
+  // Unconditional, unlike the steps above: students can always step to the end.
+  "_end_st = {'line': None, 'func': '<end>', 'depth': 0, 'out': _buf.tell(), 'file': None, 'from_line': None, 'from_file': None}",
+  '_steps.append(_end_st)',
+  '_note_new(_g)',
+  '_end_sn = _snap_ns(_g)',
+  '_snaps.append(_end_sn)',
+  '_nsize[0] += _cost(_end_st) + _cost(_end_sn)',
+  // The tracer stops AT the cap, then <end> is appended on top of it -- so on
+  // a program that filled the budget the recording lands slightly over. Drop
+  // steps from just before <end> until it fits. Off the hot path: this runs
+  // once, and only when the cap actually engaged. <end> and the first step are
+  // never dropped, so a student can always reach both ends of the recording.
+  'while _nsize[0] > _max_bytes and len(_steps) > 2:',
+  '    _nsize[0] -= _cost(_steps.pop(-2)) + _cost(_snaps.pop(-2))',
+  '    _truncated[0] = True',
+  // The per-event accounting above charges stdout GROWTH at the next line
+  // event, which bounds a print in the middle of a program but not the last
+  // one -- there is no next event to charge it at -- and does not shrink _buf
+  // after a cap abort either. So `print('x' * 10_000_000)` on the final line
+  // reached json.dumps in full. Truncate here, where the payload is actually
+  // built. The marker is left in the text on purpose: it lands in the console
+  // the student reads, which is the only place the loss is visible.
+  //
+  // Two things that clamp got wrong, and both let a multi-megabyte payload
+  // through even though the cap "held":
+  //
+  //  1. It measured CHARACTERS, and json.dumps escapes. Measured ratios for
+  //     the encoded form: a quote or a newline 2x, an accented letter 6x, and
+  //     a non-BMP emoji 12x -- one Python character becomes a \uXXXX surrogate
+  //     PAIR. So 2 Mi characters of emoji serialize to about 24 MiB. A
+  //     character count is not a byte bound.
+  //  2. It gave output the WHOLE 2 MB even when steps and snapshots had
+  //     already spent most of it, so the real ceiling was ~4 MB of payload
+  //     before escaping, not the 2 MB the cap advertises.
+  //
+  // So budget against what is LEFT, and bound the ENCODED length. The floor
+  // keeps a program that filled the budget with steps from losing its output
+  // entirely -- the output is the half the student can actually read.
+  '_out = _buf.getvalue()',
+  // _nsize only -- NOT the output, which used to be inside the same counter
+  // and so was subtracted from its own allowance (#274). The <end> step and
+  // final snapshot appended just above are charged too, so the allowance is
+  // what is genuinely left after the whole recording.
+  '_left = _max_bytes - _nsize[0]',
+  'if _left < _min_out:',
+  '    _left = _min_out',
+  '_cut = len(_out) > _left',
+  'if _cut:',
+  '    _out = _out[:_left]',
+  // Geometric, so it terminates: at most ~12 halvings from a 2 MB buffer, and
+  // the loop body does not run at all for output that does not escape.
+  "while len(_out) > 512 and len(json.dumps(_out)) - 2 > _left:",
+  '    _out = _out[:len(_out) // 2]',
+  '    _cut = True',
+  // _truncated[0] is deliberately NOT set: it drives the copy about the
+  // RECORDING being cut short, which is a different claim from the program
+  // having printed more than we can store. The marker in the text is the
+  // report, and it lands in the console the student is already reading.
+  'if _cut:',
+  "    _out = _out + '\\n... output truncated: the program printed more than the debugger can store ...\\n'",
+  "json.dumps({'error': _err, 'truncated': _truncated[0], 'bpHit': _hit[0], 'deferred': bool(_defer), 'kept': _kept[0], 'skipped': _skipped[0], 'output': _out, 'steps': _steps, 'snaps': _snaps})"
 ].join('\n');
 
 var debugRec = null;       // active recording ({error, truncated, output, steps, snaps}) or null
 var debugIdx = 0;          // current step index into debugRec.steps
 var debugRecording = false;
 var debugCancelled = false;
+var debugDeferring = false;  // this recording was asked to start at a breakpoint
 var debugMarkerId = null;      // ace marker id for the current-line highlight
 var debugMarkerSession = null; // ace session the marker was added to
 
@@ -1902,6 +2221,7 @@ function debugHighlightLine(line) {
 // actually open, and only when the file changes — repeated selectFile calls
 // per step would flash/refocus the tab bar.
 var debugShownFile = null; // file whose tab replay last selected
+var debugSelectingFile = false; // true only while replay is switching the tab
 function debugShowLine(st) {
   if (!st || st.line == null) {
     debugHighlightLine(null);
@@ -1922,7 +2242,11 @@ function debugShowLine(st) {
       // noFocus=true: switching tabs must not move keyboard focus into Ace —
       // that killed arrow-key stepping (arrows would start moving the editor
       // cursor instead of the replay).
-      editor.selectFile(file, true); // safe: only called for files that exist
+      // The flag tells the tabChanged listener below that this switch is ours,
+      // so it does not treat it as the student navigating away.
+      debugSelectingFile = true;
+      try { editor.selectFile(file, true); }  // safe: only called for files that exist
+      finally { debugSelectingFile = false; }
       debugShownFile = file;
     }
   } catch (e) { /* tab switching is best-effort */ }
@@ -1931,20 +2255,233 @@ function debugShowLine(st) {
 
 // --- Phase 3: gutter breakpoints ---------------------------------------------
 //
-// A breakpoint in the record & replay model pauses nothing — it is a
-// navigation filter over the finished recording (next/prev-breakpoint jumps
-// debugIdx to the nearest matching step), plus a recorder hint: when
-// breakpoints are set, the tracer stays dormant until execution first touches
-// one, so long preambles don't burn the step cap ("deferred recording").
-// Fully dynamic: toggling breakpoints mid-replay updates jump targets
-// instantly.
+// A breakpoint does two things over the finished recording. It is a navigation
+// filter (next/prev-breakpoint jumps debugIdx to the nearest matching step),
+// and it STOPS AUTO MODE: autoplay advances one step and pauses if it lands on
+// a marked line. It no longer gates the recorder in any way -- see the tracer.
+// Fully dynamic: the predicate reads this table live, so toggling a breakpoint
+// mid-replay updates both the jump targets and where autoplay will stop, with
+// no re-record.
 
-var debugBreakpoints = {}; // file name -> { line(1-based): true }
+// file name -> { line(1-based): true }. Null-prototype at BOTH levels, because
+// the outer key is a student-chosen file name and the failures differ by name:
+//
+//   'constructor'  `debugBreakpoints[file] || (... = {})` short-circuits to
+//                  Object.prototype.constructor, so the line is written as a
+//                  property ON THE GLOBAL Function object. It still fires --
+//                  but the state is shared with the whole page, and every file
+//                  so named collides on one map.
+//   '__proto__'    the assignment sets the prototype instead of storing
+//                  anything, so `Object.keys` sees no entry at all and the
+//                  breakpoint silently vanishes.
+//
+// Both were checked by running them, not reasoned about.
+var debugBreakpoints = Object.create(null);
 
 function debugToggleBreakpoint(file, line) {
-  var bp = debugBreakpoints[file] || (debugBreakpoints[file] = {});
+  var bp = debugBreakpoints[file] || (debugBreakpoints[file] = Object.create(null));
   if (bp[line]) delete bp[line]; else bp[line] = true;
+  // "your breakpoint was not reached" describes the table AS IT WAS when the
+  // recording ran. The student has just changed it, so drop the claim rather
+  // than leave it contradicting the pause the very next play press produces.
+  // Cleared on any toggle, not only on the marked line: the sentence names no
+  // line, so any edit to the table makes it a statement about a table that no
+  // longer exists.
+  debugBpNote = '';
+  // debugRepaintNote() ends in debugPanelSync(), which is also what tells the
+  // panel that the table changed. The panel reads hasBreakpoints live at click
+  // time and asks for bpAhead once per play press, so nothing here is painted
+  // from a cached value -- but the sync also repaints the note above, which is.
+  debugRepaintNote();
   return !!bp[line];
+}
+
+// Is the step at i on a line the student has marked? One definition, read live
+// so a breakpoint toggled mid-replay takes effect immediately. The synthetic
+// '<end>' step has a null line, so it can never be mistaken for a breakpoint.
+function debugIsBpStep(i) {
+  if (!debugRec) return false;
+  var st = debugRec.steps[i];
+  if (!st || st.line == null) return false;
+  var f = st.file || mainFile;
+  return !!(debugBreakpoints[f] && debugBreakpoints[f][st.line]);
+}
+
+// --- Slice 2: when the pill is allowed to appear -------------------------------
+//
+// Not "whenever the debugger is enabled". An affordance that is always there
+// is furniture; one that appears when it becomes useful is an offer. Three
+// conditions, all from the scoping doc's trigger rule.
+var debugHasRunOnce = false;   // set by finishRun, cleared by nothing
+
+// "At least two lines worth stepping". A line-based heuristic on purpose: this
+// decides whether an affordance appears, not what the program means, and the
+// ast transform that could answer properly is not loaded when the question is
+// first asked. Covers the three cases the design called out -- parenthesized
+// multi-line imports, module docstrings, and `from __future__` -- and stops
+// counting at two, because nobody needs the exact number.
+function debugRunnableLineCount(src) {
+  var lines = String(src || '').split('\n');
+  var count = 0, fence = null, importParen = false;
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i], t = line.trim();
+    if (fence) {                                   // inside a triple-quoted block
+      if (line.indexOf(fence) !== -1) fence = null;
+      continue;
+    }
+    if (!t || t.charAt(0) === '#') continue;
+    if (importParen) {                             // inside from x import ( ... )
+      if (t.indexOf(')') !== -1) importParen = false;
+      continue;
+    }
+    var q = t.match(/^[rubfRUBF]{0,2}("""|''')/);  // a bare string statement
+    if (q) {
+      if (t.slice(t.indexOf(q[1]) + 3).indexOf(q[1]) === -1) fence = q[1];
+      continue;                                    // module/section docstring
+    }
+    if (/^(import\s|from\s+\S+\s+import\b)/.test(t)) {
+      if (t.indexOf('(') !== -1 && t.indexOf(')') === -1) importParen = true;
+      continue;
+    }
+    if (++count >= 2) return count;
+  }
+  return count;
+}
+
+function debugPanelAvailable() {
+  if (!stepDebuggerEnabled()) return false;
+  // Never yank it away from a student who is using it. Whatever the source
+  // says now, a recording in flight or a replay on screen is the panel's
+  // whole reason to be there -- and an edit mid-replay would otherwise make
+  // the controls vanish rather than explain themselves.
+  if (debugRecording || debugRec) return true;
+  // "On first Run": before that there is no evidence the program even runs,
+  // and step-through re-runs it from scratch anyway.
+  if (!debugHasRunOnce) return false;
+  var prog = '';
+  try { prog = (editor.getAllFiles() || {})[mainFile] || ''; } catch (e) { return false; }
+  // Refusing before the click beats runStepThrough's refuse-after-the-click
+  // note: the recorder execs raw source under sys.settrace, and VPython needs
+  // the transform, so this is a permanent no rather than a not-yet.
+  if (usesVPython(prog)) return false;
+  return debugRunnableLineCount(prog) >= 2;
+}
+
+// Is any step strictly AFTER i on a marked line? Auto mode advances before it
+// tests, so the step the playhead departs from can never stop it -- that
+// asymmetry is the deadlock defence, and it is right. Its cost is that a
+// breakpoint whose ONLY recorded execution is the current step stops nothing,
+// while the panel's help promises it will: the student presses play, watches it
+// run to the end, and concludes breakpoints are broken. The panel asks this
+// once per play press so it can say what is happening instead of going quiet.
+//
+// A linear scan on purpose. It is bounded by DEBUG_MAX_STEPS (5 000) and runs
+// once per press, and an index of marked steps would have to be invalidated on
+// every gutter click -- the live read is what makes breakpoints dynamic.
+function debugBpAhead(i) {
+  if (!debugRec) return false;
+  for (var k = (i | 0) + 1; k < debugRec.steps.length; k++) {
+    if (debugIsBpStep(k)) return true;
+  }
+  return false;
+}
+
+// Auto mode's single primitive: advance one step, then report why it stopped.
+// ADVANCE FIRST, then test where it landed -- the step it departed from is
+// never tested. That asymmetry is what stops the play button being dead on the
+// very breakpoint the student is parked on: pressing play always moves off it
+// and continues to the NEXT one.
+//
+// It lives here rather than in the panel because breakpoints live here, and it
+// is an action rather than a getState flag so that a paint function never
+// decides control flow -- and so any future in-tab play button inherits the
+// pause for nothing. Deliberately NOT inside debugStepTo: every control routes
+// through that (fwd, back, first, last, both jumps, the slider, the arrow
+// keys), and a refusal there would trap the playhead.
+function debugAutoStep() {
+  if (!debugRec) return 'end';
+  var end = debugRec.steps.length - 1;
+  if (debugIdx >= end) return 'end';
+  debugStepTo(debugIdx + 1);
+  if (debugIdx >= end) return 'end';
+  if (!debugIsBpStep(debugIdx)) return 'moved';
+  return 'breakpoint';
+}
+
+// The line a failed recording died on, for the panel's error banner. Two
+// sources, because the two failure kinds leave different evidence: a RUNTIME
+// error has real steps, so the last one the tracer reached carries the line; a
+// SYNTAX error never ran at all, so the only record of it is the traceback
+// text, where Pyodide writes `File "<debug>", line N`. Last match rather than
+// first, so a multi-frame traceback reports the innermost frame.
+function debugErrorLine() {
+  if (!debugRec || !debugRec.error) return null;
+  var steps = debugRec.steps || [];
+  for (var i = steps.length - 1; i >= 0; i--) {
+    if (steps[i] && steps[i].func !== '<end>' && steps[i].line != null) {
+      return steps[i].line;
+    }
+  }
+  // No steps: a SyntaxError, which never ran, so the only record of the line
+  // is the traceback text. ANCHORED on the `File "<debug>", line N` header,
+  // and taking the FIRST match rather than the last.
+  //
+  // This used to scan for the last /line (\d+)/ anywhere in the string, with a
+  // comment about reporting the innermost frame of a multi-frame traceback --
+  // but the payload is format_exception_only (see RECORD_HELPER), which
+  // contains no frames at all, so there was never an innermost one to find.
+  // What the last match actually picked up was whatever came later in the
+  // text, and on CPython 3.13 (pinned via pyodide 0.28.1) that is the
+  // message's own suffix: "IndentationError: expected an indented block after
+  // 'for' statement on line 1" made the banner say line 1 for an error on
+  // line 2 -- on the single most common beginner mistake. It also let the
+  // student's own source set the number, because the offending line is echoed
+  // into the payload: `print('see line 99')` produced "Error on line 99".
+  var m = /^\s*File "[^"]*", line (\d+)/.exec(debugRec.error);
+  return m ? parseInt(m[1], 10) : null;
+}
+
+// The one line of a traceback worth putting in front of a student: the
+// trailing `SomeError: what went wrong`. The frames above it are noise when the
+// program is eight lines long, and the whole traceback is still in the console.
+// Anchored on the LAST `SomeError:` header and joined from there, rather than
+// simply taking the last non-blank line. The old rule was right about the
+// common shape -- a SyntaxError's final line is the message, and the two above
+// it are the offending source and a caret -- but wrong whenever the message
+// itself spans lines: `raise ValueError('line one\nline two')` showed only
+// "line two", losing both the error type and half of what the student wrote.
+// Falls back to the old behaviour when there is no header to anchor on.
+function debugErrorMessage() {
+  if (!debugRec || !debugRec.error) return null;
+  var lines = String(debugRec.error).replace(/\s+$/, '').split('\n');
+  var head = -1;
+  // The suffix group is REQUIRED. It was optional, which reduced the whole
+  // pattern to /^\w[\w.]*\s*:/ -- "any word followed by a colon" -- and since
+  // the loop keeps the LAST match, a colon inside the student's own message
+  // won: `raise ValueError('a\nfoo:')` produced a banner reading just "foo:",
+  // with the error type gone. Found by an ultrareview of #266, 2026-09-11.
+  for (var i = 0; i < lines.length; i++) {
+    if (/^\w[\w.]*(Error|Exception|Warning|Exit|Interrupt|StopIteration)\s*:/.test(lines[i])) head = i;
+  }
+  // Nothing matched, so the exception's class name ends in none of those --
+  // `class MyProblem(Exception)`, which students do write. Simply dropping the
+  // `?` above would send those to the last-line fallback below, i.e. back to
+  // the bug this function exists to fix. So: loose shape, but the FIRST match,
+  // because here the header is above the message rather than below it. The
+  // "Traceback (most recent call last):" line cannot match (a space follows
+  // the word) and the indented File lines cannot match (^\w fails).
+  if (head < 0) {
+    for (var k = 0; k < lines.length; k++) {
+      if (/^\w[\w.]*\s*:/.test(lines[k])) { head = k; break; }
+    }
+  }
+  if (head >= 0) {
+    return lines.slice(head).join(' ').replace(/\s+/g, ' ').trim();
+  }
+  for (var j = lines.length - 1; j >= 0; j--) {
+    if (lines[j].trim()) return lines[j].trim();
+  }
+  return null;
 }
 
 function debugHasBreakpoints() {
@@ -1954,10 +2491,25 @@ function debugHasBreakpoints() {
   return false;
 }
 
+// Every marked line, as { file, line }. Used to NAME the line in "your
+// breakpoint on line 7 was not reached" -- a student with one dot set should
+// not have to work out which sentence is about which line, and with several
+// set the sentence stays plural rather than guessing.
+function debugBreakpointList() {
+  var out = [];
+  for (var f in debugBreakpoints) {
+    for (var l in debugBreakpoints[f]) {
+      if (debugBreakpoints[f][l]) out.push({ file: f, line: parseInt(l, 10) });
+    }
+  }
+  return out;
+}
+
 // Breakpoint payload for the recorder: file label -> [lines]. The main file is
 // keyed '<main>' (its frames carry no file label).
 function debugBreakpointPayload() {
-  var out = {};
+  // Also file-keyed, and it is what crosses into Python.
+  var out = Object.create(null);
   for (var f in debugBreakpoints) {
     var lines = [];
     for (var l in debugBreakpoints[f]) lines.push(parseInt(l, 10));
@@ -1994,16 +2546,93 @@ function ensureGutterBreakpointHandlers() {
   } catch (e) { /* breakpoints are best-effort */ }
 }
 
-// The persistent replay note (truncated/error/deferred-start) that transient
-// flashes must restore rather than clobber.
+// Everything the HOST has to say sits in two slots. Both are painted into the
+// in-tab #debug-note and both are handed to the floating panel through
+// getState().note, which renders them at the top of its variables window.
+//
+//   debugFlashNote the answer to a press that did nothing ("no breakpoint
+//                  ahead"). Lives 2.5 s.
+//   debugBpNote    what the recorder observed about the BREAKPOINTS. This is a
+//                  record-time snapshot of a table the student can edit
+//                  mid-replay, so it stops being true the moment they touch a
+//                  gutter dot.
+//   debugBaseNote  facts about the RECORDING (truncation, "ends with an
+//                  error"). True for as long as that recording is loaded.
+//
+// Three slots rather than one string because they go stale for different
+// reasons, and composing them here means the panel needs no new inlet: it
+// already renders getState().note. Two bugs came out of not doing this.
+// Keeping the breakpoint clause inside debugBaseNote left nothing to clear it
+// on a toggle, so "your breakpoint was not reached" could sit directly above
+// the panel's own "paused at the breakpoint on line N". And flashDebugNote
+// used to write straight to the DOM without syncing, so with the panel on the
+// two circled breakpoint arrows answered a press that could not move the
+// playhead with complete silence -- verified live, not deduced.
 var debugBaseNote = '';
+var debugBpNote = '';
+var debugFlashNote = '';
+// The "ends with an error" clause, kept OUT of the panel's note channel. It
+// used to ride in debugBaseNote, and the panel stripped it with a literal
+// string match on a sentence defined here -- so rewording this file's copy
+// would have broken the panel silently and in two ways: the error stated
+// twice, once in the red banner and once beneath it, AND the note staying
+// truthy, which displaced "About to execute line 1." on the one step the
+// student is guaranteed to read. The panel now drops it by not reading a
+// field, which cannot rot.
+var debugErrorNote = '';
 var debugNoteTimer = null;
+// Order: the answer to what you just pressed, then what the recording did,
+// then what that meant for your breakpoints -- cause before consequence, so a
+// truncated run reads "recording stopped after 2873 steps · your breakpoint on
+// line 11 was not reached before it stopped".
+function debugNoteText() {
+  var parts = [];
+  if (debugFlashNote) parts.push(debugFlashNote);
+  if (debugPersistentNote()) parts.push(debugPersistentNote());
+  // The in-tab span has no red banner of its own, so it keeps the error
+  // clause; the panel's channel below does not.
+  if (debugErrorNote) parts.push(debugErrorNote);
+  return parts.join(' ');
+}
+// The persistent half only. The panel needs these two apart, because they now
+// appear at different times: the persistent notes explain the recording and
+// are wanted on arrival, while a flash answers a press and has to show
+// whenever it fires. The in-tab #debug-note span has no such distinction and
+// keeps taking everything.
+function debugPersistentNote() {
+  var parts = [];
+  if (debugBaseNote) parts.push(debugBaseNote);
+  if (debugBpNote) parts.push(debugBpNote);
+  return parts.join(' ');
+}
+// Paint both channels: the in-tab span, and the panel via getState().note.
+function debugRepaintNote() {
+  $('#debug-note').text(debugNoteText());
+  debugPanelSync();
+}
+// Say something on BOTH channels at once, and this is the only correct way to
+// say anything outside replay. #debug-note lives inside #variables-wrap, which
+// the panel path deliberately never opens (the student is stepping precisely
+// so they can watch the Result pane), so a bare $('#debug-note').text(...) is
+// invisible for the whole life of the feature whenever features.debugPanel is
+// on. Anything a student needs to read goes through here.
+function setDebugNote(msg) {
+  debugBaseNote = msg || '';
+  debugRepaintNote();
+}
+// Retract a message only if it is still the one showing -- a bail's timer must
+// not wipe the note of a recording the student started in the meantime.
+function clearDebugNoteIf(msg) {
+  if (debugBaseNote === msg) setDebugNote('');
+}
 function flashDebugNote(msg) {
-  $('#debug-note').text(msg);
+  debugFlashNote = msg || '';
+  debugRepaintNote();
   if (debugNoteTimer) clearTimeout(debugNoteTimer);
   debugNoteTimer = setTimeout(function() {
     debugNoteTimer = null;
-    $('#debug-note').text(debugBaseNote);
+    debugFlashNote = '';
+    debugRepaintNote();
   }, 2500);
 }
 
@@ -2012,19 +2641,14 @@ function flashDebugNote(msg) {
 function debugJumpBreakpoint(dir) {
   if (!debugRec) return;
   if (!debugHasBreakpoints()) {
-    flashDebugNote('no breakpoints — click left of a line number to add one');
+    flashDebugNote('No breakpoints are set. Click the grey margin left of a line number to add one.');
     return;
   }
   for (var i = debugIdx + dir; i >= 0 && i < debugRec.steps.length; i += dir) {
-    var st = debugRec.steps[i];
-    if (st.line == null) continue;
-    var f = st.file || mainFile;
-    if (debugBreakpoints[f] && debugBreakpoints[f][st.line]) {
-      debugStepTo(i);
-      return;
-    }
+    if (debugIsBpStep(i)) { debugStepTo(i); return; }
   }
-  flashDebugNote(dir > 0 ? 'no breakpoint ahead' : 'no breakpoint behind');
+  flashDebugNote(dir > 0 ? 'There is no breakpoint ahead of here.'
+                         : 'There is no breakpoint behind here.');
 }
 
 // Render the variables table for a recorded step (flat, no expansion — the
@@ -2098,6 +2722,7 @@ function renderDebugStep() {
                   st,
                   debugIdx > 0 ? debugRec.snaps[debugIdx - 1] : null);
   debugShowLine(st);
+  debugPanelSync();
   if (jqconsole) {
     var wantErr = isEnd && !!debugRec.error;
     if (debugLastOut === -1 || st.out < debugLastOut || wantErr !== debugErrShown) {
@@ -2122,14 +2747,180 @@ function renderDebugStep() {
   }
 }
 
+// Which names the STUDENT introduced, in the order they came into existence.
+//
+// The snapshot filter already drops dunders, modules and injected names, and
+// the recorder's snapshots carry no functions or classes -- but that is not
+// enough. `from math import *` binds pi, e, tau, inf and nan as plain floats,
+// and `from sympy import *` binds a great many more; all of them arrive as
+// ordinary values and bury the two variables the student actually wrote.
+//
+// So attribute each name to the line that bound it. A `line` trace event fires
+// BEFORE its line runs, so a name first visible at step k was bound by the line
+// of step k-1; if that line is an import statement, the name is library
+// furniture rather than the student's. This needs no blocklist and handles
+// `import x`, `from x import y` and `from x import *` alike.
+var debugVarModel = null;   // cached per recording; cleared on enter/exit
+
+var DEBUG_IMPORT_RE = /^\s*(?:import\s|from\s+[.\w]+\s+import\b)/;
+
+function debugBuildVarModel() {
+  if (!debugRec) return null;
+  if (debugVarModel) return debugVarModel;
+
+  // Both file-keyed, so both take the same null-prototype treatment as
+  // debugBreakpoints -- `lineCache['constructor']` is otherwise truthy and
+  // returns a Function where a line array is expected.
+  var files = Object.create(null);
+  try { files = editor.getAllFiles() || files; } catch (e) { files = Object.create(null); }
+  var lineCache = Object.create(null);
+  function sourceLine(file, line) {
+    var key = file || mainFile;
+    if (!(key in lineCache)) {
+      lineCache[key] = files[key] == null ? null : String(files[key]).split('\n');
+    }
+    var arr = lineCache[key];
+    return arr && line > 0 && line <= arr.length ? arr[line - 1] : null;
+  }
+
+  // Null-prototype: these are keyed by STUDENT variable names, and a plain
+  // object answers `'constructor' in firstStep` before anything is recorded --
+  // so a variable so named would read as already-seen and vanish.
+  var order = [], firstStep = Object.create(null), fromImport = Object.create(null);
+  for (var k = 0; k < debugRec.snaps.length; k++) {
+    // Main-file steps only. `from lots import *` executes lots.py, and the
+    // tracer follows user modules -- so those steps snapshot THAT module's
+    // globals, where the star-exported names are local and legitimate. They
+    // are not the student's variables, and without this the list filled with
+    // the first fifty of them. A variable defined in a second file the student
+    // wrote is excluded too; that is the deliberate trade.
+    var stp = debugRec.steps[k];
+    if (stp && stp.file) continue;
+    var snap = debugRec.snaps[k] || [];
+    for (var j = 0; j < snap.length; j++) {
+      var nm = snap[j].name;
+      if (nm in firstStep) continue;
+      firstStep[nm] = k;
+      order.push(nm);
+      var prev = k > 0 ? debugRec.steps[k - 1] : null;
+      var src = prev && prev.line ? sourceLine(prev.file, prev.line) : null;
+      if (src && DEBUG_IMPORT_RE.test(src)) fromImport[nm] = true;
+    }
+  }
+  debugVarModel = { order: order, firstStep: firstStep, fromImport: fromImport };
+  return debugVarModel;
+}
+
 function debugStepTo(idx) {
   if (!debugRec) return;
+  // A flash answers a press that could NOT move the playhead ("no breakpoint
+  // ahead"). The moment one does move, that answer is about a step the student
+  // has left, so retract it rather than let it ride out its 2.5 s above the
+  // new step's variables. Caught live: three jumps in a row all showed the
+  // first one's answer, which only became visible once flashes reached the
+  // panel at all.
+  if (debugFlashNote) {
+    debugFlashNote = '';
+    if (debugNoteTimer) { clearTimeout(debugNoteTimer); debugNoteTimer = null; }
+    $('#debug-note').text(debugNoteText());   // sync comes with renderDebugStep
+  }
   debugIdx = Math.max(0, Math.min(idx, debugRec.steps.length - 1));
   renderDebugStep();
 }
 
+// 49906 -> "49,906". Deliberately not toLocaleString: its separator is
+// locale-dependent, and a de-DE reader would get "49.906" -- a period in the
+// middle of a sentence, in a panel whose messages are all sentences now.
+function debugThousands(n) {
+  return String(n).replace(/\B(?=(\d{3})+(?!\d))/g, ',');
+}
+
+// Per-step "how many times has THIS line run by now", precomputed once so the
+// slider's tooltip can say "about to execute line 8 for the 43rd time". One
+// pass over at most DEBUG_MAX_STEPS entries; recomputing it per hover would be
+// the same work repeated on every sync during autoplay.
+var debugVisits = null;
+// The step at which the program first repeats a line -- i.e. the first moment
+// there is a loop to be in. Null if it never repeats one.
+//
+// Before it, "for the first time" is true of every line and therefore says
+// nothing: a straight-line program would carry the clause on every single step
+// and never once be informative. From it onwards the ordinal earns its place,
+// INCLUDING on a line's first visit -- a branch inside a loop that finally
+// fires on pass 40 saying "for the 1st time" is telling you something real.
+//
+// Keyed on the step INDEX, not on where the student has been, so the same step
+// always reads the same however they got there. A sticky flag would make one
+// step say two different things depending on history.
+var debugRepeatFrom = null;
+function debugBuildVisits(rec) {
+  var seen = Object.create(null), out = new Array(rec.steps.length), i, st, k;
+  debugRepeatFrom = null;
+  for (i = 0; i < rec.steps.length; i++) {
+    st = rec.steps[i];
+    if (!st || st.line == null) { out[i] = 0; continue; }
+    k = (st.file || '<main>') + ':' + st.line;
+    seen[k] = (seen[k] || 0) + 1;
+    out[i] = seen[k];
+    if (out[i] >= 2 && debugRepeatFrom === null) debugRepeatFrom = i;
+  }
+  return out;
+}
+
+// How many COMPLETE passes through the busiest loop the recording holds, or
+// null if there is no loop worth naming.
+//
+// The counting rule matters, because the obvious one is off by one. A `for`
+// header fires once per pass PLUS once more when the iterator is exhausted (or
+// when the recording is cut mid-body), so the maximum count belongs to the
+// header and overstates completed passes. Within one truncated final pass the
+// loop's own lines differ by at most one, so: take the lines whose count is
+// within 2 of the maximum -- that is the loop, header included -- and report
+// the MINIMUM of them, which is the last body line to have run. On the
+// dt=0.001 projectile that gives 873, matching the `i = 873` the variables
+// window shows at the final step. Taking the maximum would have said 875.
+function debugLoopIterations(rec) {
+  var counts = Object.create(null), i, st, k, max = 0;
+  for (i = 0; i < rec.steps.length; i++) {
+    st = rec.steps[i];
+    if (!st || st.line == null) continue;
+    k = (st.file || '<main>') + ':' + st.line;
+    counts[k] = (counts[k] || 0) + 1;
+    if (counts[k] > max) max = counts[k];
+  }
+  // Nothing ran more than a couple of times: a straight-line program, or
+  // recursion without a loop. Claiming "iterations of your loop" here would be
+  // a plain falsehood, so say nothing about loops.
+  if (max < 3) return null;
+  // ONE LOOP, OR DECLINE. The within-2 rule assumes a single loop, where the
+  // header fires at most one more time than the body. Under NESTING the counts
+  // differ multiplicatively: measured on `for i in range(2000)` around
+  // `for j in range(2)`, the inner header fired 2,500 times, the inner body
+  // 1,666 and the outer header 834 -- so the filter admitted only the inner
+  // header and reported 2,500 as "iterations of your loop", 50% above the
+  // inner count and 3x the outer. Stating a wrong number as fact is worse
+  // than not naming one.
+  //
+  // The discriminator is the gap to the next DISTINCT count: ~1.00 for a
+  // single loop (875 vs 874), 1.50 for the nested case above. Past 1.25 the
+  // shape is not a simple loop and the caller falls back to a sentence that is
+  // true of any program. This also declines on recursion deep enough to
+  // truncate, which `max < 3` does not catch.
+  var distinct = [];
+  for (k in counts) if (distinct.indexOf(counts[k]) === -1) distinct.push(counts[k]);
+  distinct.sort(function(a, b) { return b - a; });
+  if (distinct.length > 1 && max / distinct[1] > 1.25) return null;
+  var min = max;
+  for (k in counts) {
+    if (counts[k] >= max - 2 && counts[k] < min) min = counts[k];
+  }
+  return min;
+}
+
 function enterReplay(rec) {
   debugRec = rec;
+  debugVisits = debugBuildVisits(rec);
+  debugVarModel = null;
   debugIdx = 0;
   debugLastOut = -1;
   debugErrShown = false;
@@ -2137,16 +2928,99 @@ function enterReplay(rec) {
   $('#debug-launch').addClass('hide');
   $('#debug-controls').removeClass('hide');
   var notes = [];
-  // rec.armed is false only when breakpoints were set but never hit;
-  // rec.skipped counts dormant line events before the first breakpoint fired.
-  if (rec.armed === false) notes.push('no breakpoint was reached — nothing recorded');
-  else if (rec.skipped) notes.push('recording started at the first breakpoint');
-  if (rec.truncated) notes.push('recording stopped after ' + (rec.steps.length - 1) + ' steps');
-  if (rec.error) notes.push('ends with an error');
-  debugBaseNote = notes.join(' · ');
-  $('#debug-note').text(debugBaseNote);
-  showVariables();
-  renderDebugStep();
+  // bpHit is false whenever breakpoints were set and the recorder never saw
+  // one execute. Say only that, because that is all the flag carries. It used
+  // to say "that line never ran", which asserts knowledge the recorder does
+  // not have: the flag is equally false when the recording simply STOPPED
+  // first (5 000 steps / 2 MB), when the line lives deeper than
+  // DEBUG_MAX_DEPTH frames, and when the dot belongs to a file the student has
+  // since renamed or deleted. A student told "that line never ran" about a
+  // line that ran 40 000 times will believe the debugger over their own
+  // program, and go looking for a bug that is not there.
+  //
+  // The truncated case gets its own sentence because it has a remedy the
+  // student can act on -- shorten the loop -- and because "not reached" and
+  // "never ran" are different claims.
+  // A deferred recording is not a recording of the program -- it is a window
+  // around the student's breakpoint -- so say so first, before the caps and
+  // the breakpoint status. Both numbers are real: `kept` is what the ring
+  // actually held (fewer than the full window if the breakpoint came early),
+  // and `skipped` is what it dropped to get there.
+  if (rec.deferred && rec.bpHit && debugBreakpointList().length) {
+    var kept = rec.kept || 0, skipped = rec.skipped || 0;
+    var bl0 = debugBreakpointList();
+    var where = bl0.length === 1 ? 'your breakpoint on line ' + bl0[0].line
+                                 : 'your breakpoint';
+    notes.push(kept
+      ? 'Playback starts ' + debugThousands(kept) + (kept === 1 ? ' step' : ' steps') + ' before ' + where + '.'
+      : 'Playback starts at ' + where + '.');
+    if (skipped) {
+      // "The 49,906 lines before that..." rather than "49906 earlier lines..."
+      // -- a sentence should not open with a digit.
+      notes.push('The ' + debugThousands(skipped)
+        + ' lines before that were not recorded.');
+    }
+  }
+  debugBpNote = '';
+  var bps = debugBreakpointList();
+  // bps can be empty here even with bpHit false, if every dot was cleared
+  // between the run and the replay -- then there is nothing to report.
+  if (rec.bpHit === false && bps.length) {
+    var one   = bps.length === 1;
+    var which = one ? 'your breakpoint on line ' + bps[0].line : 'your breakpoints';
+    var verb  = one ? 'was' : 'were';
+    // Capitalised here rather than at the join, because this clause can also
+    // stand alone as the only note.
+    debugBpNote = which.charAt(0).toUpperCase() + which.slice(1)
+                + ' ' + verb + ' not reached'
+                + (rec.truncated ? ' before the recording stopped.' : '.');
+  }
+  // Says what you HAVE, and what to do to see more. The old text --
+  // "recording stopped after 4371 steps" -- read as a failure report for what
+  // is usually not a failure (4371 steps is more than anyone hand-steps), gave
+  // a number with no referent, and named no action. "steps" is the debugger's
+  // unit too; iterations are the student's.
+  //
+  // No code example on the end, deliberately. `range(50) instead of
+  // range(10000)` is only literally true of `for i in range(10000)`: it is
+  // misleading when the bound is a variable (there is no range(10000) in the
+  // file to find), wrong when the bound is computed, and meaningless for a
+  // `while` loop, which is the projectile idiom. The advice generalises;
+  // the example did not.
+  if (rec.truncated) {
+    var iters = debugLoopIterations(rec);
+    notes.push(iters
+      ? 'The first ' + debugThousands(iters) + ' iterations of your loop are'
+        + ' stored to play in the debugger. If you want to see the whole'
+        + ' program, loop through fewer iterations while debugging.'
+      : 'The first ' + debugThousands(rec.steps.length - 1) + ' lines your'
+        + ' program ran are stored to play in the debugger.');
+  }
+  // Unconditional. This used to be gated on !debugPanelEnabled(), on the
+  // reasoning that the panel shows a bold red banner instead -- but
+  // debugPanelEnabled() is a pure CONFIG read and says nothing about whether
+  // the panel is rendering anything right now. The banner lives past the
+  // panel's `if (!expanded) return` guard, and a collapsed pill mid-replay is
+  // reachable: the in-tab controls are still emitted with the flag on
+  // (pyodide.html gates them on stepDebugger alone), so a student can start
+  // step-through from the Variables tab with the pill shut. In that state the
+  // note was suppressed, the banner was unreachable, and showVariables() had
+  // hidden the console -- so nothing anywhere said the run ends badly.
+  // The panel drops this clause itself when its red banner IS showing.
+  debugErrorNote = rec.error ? 'This run ends with an error.' : '';
+  // A SPACE, not ' · '. Every note is now a full sentence starting with a
+  // capital and ending with a period, so a middle dot between them read as
+  // punctuation inside one sentence -- "...while debugging. · Your breakpoint
+  // on line 11..." Ordinary prose spacing is what sentences want.
+  debugBaseNote = notes.join(' ');
+  $('#debug-note').text(debugNoteText());
+  // Without the floating panel the controls only exist inside the Variables
+  // tab, so entering replay has to open it. With the panel, opening it would
+  // defeat the point of the feature: the student is stepping precisely so they
+  // can watch the Result pane change. paintReplaySnap keeps writing the table
+  // either way, so switching to Variables by hand still shows the right step.
+  if (!debugPanelEnabled()) showVariables();
+  renderDebugStep();   // ends in debugPanelSync()
 }
 
 // Leave replay mode. `quiet` skips the console restore — used by callers that
@@ -2154,16 +3028,50 @@ function enterReplay(rec) {
 // Reset Output button), where restoring the recording's output first would be
 // wasted or actively wrong. The ✕ button uses the default (restore), so
 // exiting by hand leaves the full recorded output visible.
-function exitReplay(quiet) {
+// `why` says what to do with the console, because the three exits want three
+// different things and a boolean could only express two:
+//
+//   undefined / 'restore'  the X button. A deliberate exit, so restore the
+//                          full recorded output AND its traceback -- nothing
+//                          about the program has changed.
+//   true / 'quiet'         a fresh run or a replaced program is about to
+//                          rewrite the console anyway; touching it here would
+//                          be wasted or actively wrong.
+//   'stale'                the student EDITED the code. The output still
+//                          belongs to a run that happened, but the traceback
+//                          describes source that no longer exists -- and
+//                          re-posting it at the moment they fix the error is
+//                          how the debugger came to announce a bug they had
+//                          just repaired. Larry found this by using it.
+//
+// `true` is still accepted so the two fresh-run callers read unchanged.
+function exitReplay(why) {
+  var quiet = (why === true || why === 'quiet');
+  var stale = (why === 'stale');
   if (!debugRec) return;
   var rec = debugRec;
   debugRec = null;
+  // THE PLAYHEAD RESETS TOO. Everything else about the recording was cleared
+  // here and debugIdx was not, so getState() went on reporting idx: 5 next to
+  // replaying: false -- and the panel gates the recorder's note on
+  // `s.idx === 0` meaning "just arrived at a recording". Read in a state with
+  // no recording, that test sent every bail message (VPython, console input,
+  // "The recording failed.", and both deferred give-ups) into a branch that
+  // renders nothing, so they landed nowhere at all. The in-tab span still got
+  // them, which is exactly the pane the panel path never opens.
+  debugIdx = 0;
+  debugVisits = null;
+  debugRepeatFrom = null;
+  debugVarModel = null;
   debugLastOut = -1;
   debugErrShown = false;
   debugShownFile = null;
   debugHighlightLine(null);
   $('#debug-controls').addClass('hide');
   debugBaseNote = '';
+  debugBpNote = '';
+  debugFlashNote = '';
+  debugErrorNote = '';
   if (debugNoteTimer) { clearTimeout(debugNoteTimer); debugNoteTimer = null; }
   $('#debug-note').text('');
   $('#debug-launch').removeClass('hide');
@@ -2175,22 +3083,45 @@ function exitReplay(quiet) {
     jqconsole.Reset();
     jqconsole.Append(loadingHeader());
     consoleWrite(rec.output);
-    if (rec.error) consoleWrite('\n' + escapeConsoleHtml(rec.error) + '\n', 'jqconsole-error', false);
+    if (rec.error) {
+      if (stale) {
+        // PAST TENSE, and more than that: it names the edit that superseded
+        // the error, which is the fact the student can check, and it ends with
+        // something to do. Tense alone does not carry it -- a red traceback
+        // below has no tense and reads as current whatever sits above it --
+        // so the traceback is demoted out of the error class here too. The
+        // panel's own red banner is untouched; this is the console copy only.
+        consoleWrite('\nThis ran before your last edit \u2014 the error below may'
+          + ' already be fixed. Press Run to check.\n', 'jqconsole-output', false);
+        consoleWrite(escapeConsoleHtml(rec.error) + '\n', 'jqconsole-output', false);
+      } else {
+        consoleWrite('\n' + escapeConsoleHtml(rec.error) + '\n', 'jqconsole-error', false);
+      }
+    }
   }
   paintVariables();
+  debugPanelSync();
 }
 
 // Run the program under the recorder, then enter replay. Mirrors startRun's
 // pre-steps (FS sync, package auto-load, matplotlib target) but execs in a
 // fresh namespace under trace. Normal Run is untouched.
-function runStepThrough() {
+// `defer` is the OPT-IN deferred recording: coast without recording until a
+// marked line executes, keeping only the last DEBUG_LOOKBACK_STEPS steps
+// before it. Every pre-existing caller passes nothing, so it is false and the
+// recorder behaves exactly as before. The only thing that passes true is the
+// panel's "record from the breakpoint instead" button, which is only offered
+// after a recording truncated before reaching the student's breakpoint.
+function runStepThrough(defer) {
   if (running || debugRecording) return;
   if (debugRec) exitReplay();
 
   debugRecording = true;
+  debugDeferring = !!defer;
   debugCancelled = false;
   $('#debug-launch').addClass('hide');
   $('#debug-recording').removeClass('hide');
+  debugPanelSync();
 
   // `ran` says whether the recorder actually executed the program. The bails
   // above it (debugCancelled, a normal run got in first, VPython, console) resolve
@@ -2199,6 +3130,7 @@ function runStepThrough() {
   // trinket that flipped the panel from "no backend" onto THIS thread's
   // Pyodide, which never ran the program and holds no figure.
   function recordingDone(ran) {
+    debugDeferring = false;   // never inherited by the next recording
     debugRecording = false;
     $('#debug-recording').addClass('hide');
     if (!debugRec) $('#debug-launch').removeClass('hide');
@@ -2208,6 +3140,7 @@ function runStepThrough() {
     if (ran && window.trinketPlotpolish) {
       try { trinketPlotpolish.afterRun('main'); } catch (e) {}
     }
+    debugPanelSync();
   }
 
   ensurePyodide().then(function() {
@@ -2217,8 +3150,13 @@ function runStepThrough() {
     // docs/superpowers/plans/2026-09-04-sympy-math-output.md.
     var prog = syncFilesToFS(editor.getAllFiles(), mainFile);
     if (usesVPython(prog)) {
-      $('#debug-note').text('Step through is not available for VPython programs');
-      setTimeout(function() { $('#debug-note').text(''); }, 4000);
+      // setDebugNote, not $('#debug-note').text: with features.debugPanel on
+      // the in-tab note lives in a pane the panel never opens, so writing
+      // there alone means the pill flashes "Recording..." and returns to
+      // "step through" with no explanation anywhere on screen.
+      var vpyMsg = 'Step through is not available for VPython programs.';
+      setDebugNote(vpyMsg);
+      setTimeout(function() { clearDebugNoteIf(vpyMsg); }, 4000);
       return null;
     }
     if (usesConsole(prog) && !userShadowsConsole()) {
@@ -2228,8 +3166,9 @@ function runStepThrough() {
       // (a silently-wrong coroutine, and the input field would never open).
       // Bail with the same mechanism/style as the VPython guard above rather
       // than teaching the recorder about the transform.
-      $('#debug-note').text('Step through is not available for programs that read console input');
-      setTimeout(function() { $('#debug-note').text(''); }, 4000);
+      var inputMsg = 'Step through is not available for programs that read console input.';
+      setDebugNote(inputMsg);
+      setTimeout(function() { clearDebugNoteIf(inputMsg); }, 4000);
       return null;
     }
     return pyodide.loadPackagesFromImports(prog).then(function() {
@@ -2249,15 +3188,21 @@ function runStepThrough() {
             // Secondary .py files sync to the Pyodide FS home dir; frames from
             // there are user code the tracer should step through (Phase 2).
             _user_prefix: '/home/pyodide/',
-            // Phase 3: with breakpoints set, the tracer stays dormant until
-            // one is hit (deferred recording).
+            // Breakpoints are passed in so the recorder can report whether one
+            // was ever REACHED (_hit). They do not gate recording unless
+            // _defer is set, which only the panel's explicit "record from the
+            // breakpoint instead" button does.
             _bp: debugBreakpointPayload(),
+            // Opt-in only; see runStepThrough's `defer`.
+            _defer: debugDeferring,
+            _lookback: DEBUG_LOOKBACK_STEPS,
+            _max_dormant: DEBUG_MAX_DORMANT,
             _max_steps: DEBUG_MAX_STEPS,
             _max_vars: DEBUG_MAX_VARS,
             _max_repr: DEBUG_MAX_REPR,
             _max_depth: DEBUG_MAX_DEPTH,
             _max_bytes: DEBUG_MAX_BYTES,
-            _max_dormant: DEBUG_MAX_DORMANT
+            _min_out: DEBUG_MIN_OUTPUT_BYTES
           });
           return JSON.parse(pyodide.runPython(RECORD_HELPER, { globals: ns }));
         } finally {
@@ -2270,13 +3215,41 @@ function runStepThrough() {
   }).then(function(rec) {
     recordingDone(!!rec && !debugCancelled);
     if (rec && !debugCancelled) {
+      // A deferred recording that never armed holds nothing but the synthetic
+      // <end> step: the marked line did not execute at all, so there was
+      // nothing to start from. Report it instead of opening a replay of one
+      // empty step -- and report it plainly, because this run ANSWERS the
+      // question the ordinary one could not. A truncated recording cannot
+      // tell "that line is unreachable" from "that line is past the cap";
+      // this one just did, and the answer is unreachable.
+      if (rec.deferred && rec.bpHit === false) {
+        var bl = debugBreakpointList();
+        var one = bl.length === 1;
+        // TWO different causes, and bpHit alone cannot tell them apart --
+        // rec.truncated can. Saying "never ran" on the give-up path would be
+        // the same lie this whole branch exists to stop telling: with dt one
+        // decade smaller the coast trips the 200,000-event cap and the line
+        // runs 10,000 times. The second run's whole justification is that it
+        // CAN separate "unreachable" from "past the cap", so it has to.
+        if (rec.truncated) {
+          setDebugNote(one
+            ? 'Gave up before reaching line ' + bl[0].line
+              + '. The program runs too long above it.'
+            : 'Gave up before reaching any of the lines you marked.');
+        } else {
+          setDebugNote(one
+            ? 'Line ' + bl[0].line + ' never ran, so there was nothing to record from it.'
+            : 'None of the lines you marked ran, so there was nothing to record from.');
+        }
+        return;
+      }
       initConsoleOutput();
       enterReplay(rec);
     }
   }).catch(function(err) {
     recordingDone(false);
-    $('#debug-note').text('recording failed');
-    setTimeout(function() { $('#debug-note').text(''); }, 4000);
+    setDebugNote('The recording failed.');
+    setTimeout(function() { clearDebugNoteIf('The recording failed.'); }, 4000);
   });
 }
 
@@ -3226,6 +4199,14 @@ function finishRun(serializedCode, err) {
     try { trinketPlotpolish.afterRun(window.__trinketRuntime); } catch (e) {}
   }
 
+  // The panel's "is there anything to step?" answer can change with a run --
+  // and the FIRST run is half of the answer (slice 2's trigger rule).
+  debugHasRunOnce = true;
+  // The panel's "is there anything to step?" answer can change with a run.
+  if (window.trinketDebugPanel) {
+    try { trinketDebugPanel.afterRun(window.__trinketRuntime); } catch (e) {}
+  }
+
   // A Run was clicked while the previous (VPython) run was being cancelled;
   // now that it has stopped, start the fresh run.
   if (rerunQueued) {
@@ -3649,11 +4630,62 @@ window.TrinketAPI = {
         // later get wired when their tab is first selected.
         ensureGutterBreakpointHandlers();
         $('#editor').on('codeeditor.tabChanged', ensureGutterBreakpointHandlers);
+        // The STUDENT switched tabs mid-replay. debugShownFile still names the
+        // file replay last selected, so the next step would skip selectFile and
+        // debugHighlightLine would mark whichever session is now active -- the
+        // highlight landing in the wrong file, on a line number that means
+        // something else there. Forget it and let the next step re-select.
+        $('#editor').on('codeeditor.tabChanged', function() {
+          if (!debugSelectingFile) debugShownFile = null;
+        });
+        // debugBreakpoints is keyed by file NAME and outlives the file. A dot
+        // left behind by a deleted or renamed file can never be hit, so every
+        // later recording reports bpHit false and the panel says a breakpoint
+        // was not reached -- naming a line in a file that is no longer there.
+        // (Before this branch it was worse: the tracer stayed dormant waiting
+        // for that breakpoint, so every recording came back EMPTY for the rest
+        // of the page session.) Follow the file instead of orphaning the key.
+        $('#editor').on('codeeditor.fileRemoved', function(e) {
+          if (e.fileName && debugBreakpoints[e.fileName]) {
+            delete debugBreakpoints[e.fileName];
+            debugPanelSync();
+          }
+        });
+        $('#editor').on('codeeditor.fileRenamed', function(e) {
+          if (e.oldFileName && debugBreakpoints[e.oldFileName]) {
+            if (e.newFileName) debugBreakpoints[e.newFileName] = debugBreakpoints[e.oldFileName];
+            delete debugBreakpoints[e.oldFileName];
+            debugPanelSync();
+          }
+        });
         $('#debug-prev-bp').on('click keydown', debugActivate(function() { debugJumpBreakpoint(-1); }));
         $('#debug-next-bp').on('click keydown', debugActivate(function() { debugJumpBreakpoint(1); }));
 
-        // Arrow-key stepping while replaying (ignored while typing in the
-        // editor or any input, so it never hijacks code editing).
+        // ARROW KEYS: who gets them during a replay. Three claimants, and the
+        // rule is FOCUS DECIDES -- settled 2026-09-08 when the floating panel
+        // started overlapping the editor, which is what made it a question.
+        //
+        //   1. Focus inside Ace, or in any input/textarea -> the TEXT gets
+        //      them. Bailing here rather than anywhere else is deliberate:
+        //      replay does not stop a student reading around their code, and
+        //      silently turning ArrowRight into "step" while the caret is
+        //      visibly blinking in the editor would be indefensible. Note that
+        //      replay's own tab switches pass noFocus=true precisely so they
+        //      cannot drop focus into Ace and take the arrows away.
+        //   2. Focus on a drag grip -- the pill's or the variables window's --
+        //      -> that WINDOW gets them, 8px per press. Both grips call
+        //      stopPropagation, so this handler never sees those events. The
+        //      variables grip was the broken one: its listener was bound to a
+        //      node that paintVars() replaces, so before the window had been
+        //      dragged with a mouse the arrows fell through to here and
+        //      stepped the recording.
+        //   3. Anywhere else -> the RECORDING gets them, one step per press,
+        //      which is where focus sits after any panel button is pressed.
+        //
+        // Stepping by arrow also stops the panel's autoplay: it goes through
+        // debugStepTo like every other control, and the panel's timer notices
+        // an index it did not produce. So the keys never fight the timer.
+        //
         // Shift+arrow jumps to the previous/next breakpoint (Phase 3).
         $(document).on('keydown.stepDebugger', function(e) {
           if (!debugRec) return;
@@ -3706,10 +4738,48 @@ window.TrinketAPI = {
 
     editor.change(function() {
       api.triggerChange();
+      // A recording is a snapshot of the source that produced it, so an edit
+      // invalidates it. This is not a new rule -- showResult and replaceMain
+      // already exitReplay() for a fresh run and for a replaced program; a
+      // keystroke is the same event class and was simply never wired up.
+      //
+      // Without it the student keeps stepping a recording of code that no
+      // longer exists, and it fails SILENTLY rather than visibly: the Ace
+      // marker is an unanchored Range, so the highlight band stays on its row
+      // while the text on that row changes, and the variables window goes on
+      // showing values -- even names -- from the old program. Verified in a
+      // running embed: the panel reported `dt = 0.1` and a variable `x` that
+      // appeared nowhere in the file on screen.
+      //
+      // Not quiet: the non-quiet path restores the console the way the panel's
+      // exit already does, so nothing left behind becomes a lie either.
+      var wasReplaying = !!debugRec;
+      if (wasReplaying) exitReplay('stale');
+      // The same rule, one state earlier. A recording in flight is also a
+      // snapshot of source that no longer exists -- runStepThrough captured
+      // `prog` before an await, so an edit during the async window (package
+      // loading, matplotlib setup, the traced exec itself) produced a replay
+      // of code the student can no longer see, with nothing saying so. That is
+      // the exact silent failure this handler was added to prevent; it just
+      // did not cover the window before enterReplay. debugCancelled is already
+      // read by every stage of the chain.
+      if (debugRecording) debugCancelled = true;
+      // With the floating panel off, the panel's explanation does not exist,
+      // so replay ended with the controls simply vanishing. Say it here
+      // instead. After exitReplay(), which clears the note slots.
+      if (wasReplaying && !debugPanelEnabled()) {
+        setDebugNote('Step-through closed because you edited the code.');
+      }
       // Guarded like the afterRun hooks: editor.change is single-owner, so a
       // throw from the optional plugin would take the change pipeline with it.
       if (window.trinketPlotpolish) {
         try { trinketPlotpolish.onEditorChange(); } catch (e) {}
+      }
+      if (window.trinketDebugPanel) {
+        // The flag says WHY replay ended. That is what lets the panel put an
+        // explanation where the values were instead of just emptying the
+        // window and leaving the student to wonder where their variables went.
+        try { trinketDebugPanel.onEditorChange(wasReplaying); } catch (e) {}
       }
     });
 
@@ -3730,6 +4800,105 @@ window.TrinketAPI = {
               // (wasReplActive) -- this is the sibling that guard was missing.
               return running || debugRecording || replEvaluating
                   || (workerClient && workerClient.isRunning());
+            }
+        });
+      } catch (e) {}
+    }
+
+    // The floating debugger panel lives in public/js/plugins/debug-panel.js.
+    // Same handover reason as plotpolish above: this file is a closure, so the
+    // replay state and its actions are not reachable from out there. The panel
+    // is a VIEW -- it reads getState() and calls back into these functions;
+    // it holds no debugger state of its own, and the in-tab controls keep
+    // working whether it is present or not.
+    if (debugPanelEnabled() && window.trinketDebugPanel) {
+      try {
+        trinketDebugPanel.init({
+            // Slice 2: only after a Run, only with >= 2 non-import lines,
+            // never for VPython. See debugPanelAvailable().
+            isAvailable : debugPanelAvailable
+          , getState : function() {
+              var st = debugRec ? debugRec.steps[debugIdx] : null;
+              return {
+                  recording      : debugRecording
+                , replaying      : !!debugRec
+                , idx            : debugIdx
+                , total          : debugRec ? debugRec.steps.length - 1 : 0
+                , atEnd          : !!(st && st.func === '<end>')
+                  // Whether the recorder ran out of budget. The panel needs it
+                  // to keep quiet about reaching "the end": on a truncated run
+                  // the <end> step carries no error, so the panel printed
+                  // "Reached the end & stopped" directly above the recorder's
+                  // accurate "recording stopped after N steps" -- two claims
+                  // that cannot both be true, one of them ours.
+                , truncated      : !!(debugRec && debugRec.truncated)
+                  // Offer to re-record from the breakpoint only when the
+                  // evidence is in: the recording ran out of budget AND the
+                  // marked line never came up. Never on a recording that was
+                  // itself deferred -- one attempt answers the question, and
+                  // re-offering it would loop the student round a re-run that
+                  // has already told them what they needed to know.
+                , canDefer       : !!(debugRec && debugRec.truncated
+                                      && debugRec.bpHit === false
+                                      && !debugRec.deferred
+                                      && debugHasBreakpoints())
+                , deferLine      : (function() {
+                    var bl = debugBreakpointList();
+                    return bl.length === 1 ? bl[0].line : null;
+                  })()
+                  // The persistent notes only; the flash rides its own field
+                  // because the panel shows the two at different times.
+                , note           : debugPersistentNote()
+                , flash          : debugFlashNote
+                , hasBreakpoints : debugHasBreakpoints()
+                  // For painting only. The pause itself is actions.autoStep, so
+                  // that a paint value never becomes a control value.
+                , line           : (function() {
+                    var st = debugRec ? debugRec.steps[debugIdx] : null;
+                    return st ? st.line : null;
+                  })()
+                , atBreakpoint   : debugIsBpStep(debugIdx)
+                  // Whether pressing play can still stop at anything. Read
+                  // once per play press, not painted.
+                , bpAhead        : debugBpAhead(debugIdx)
+                  // "about to execute line 8 for the 43rd time" -- a line
+                  // event fires BEFORE its line runs, which is why the
+                  // tooltip says "about to".
+                , lineVisit      : (debugVisits && debugVisits[debugIdx]) || 0
+                  // Whether the ordinal has earned its place yet: see
+                  // debugRepeatFrom.
+                , visitOrdinals  : !!(debugRepeatFrom !== null && debugIdx >= debugRepeatFrom)
+                  // The panel is a VIEW, so parsing a traceback is this side's
+                  // job, not its own.
+                , hasError       : !!(debugRec && debugRec.error)
+                , errorLine      : debugErrorLine()
+                , errorMsg       : debugErrorMessage()
+                  // The panel starts a recording on the same click that opens
+                  // it, and runStepThrough() refuses while anything else is
+                  // executing. Without knowing that, the panel would open and
+                  // silently do nothing.
+                , busy           : running || replEvaluating
+                                     || !!(workerClient && workerClient.isRunning())
+              };
+            }
+            // The panel builds its own list from these; presentation stays out
+            // here, the data stays in there.
+          , getVarModel : debugBuildVarModel
+          , getVars : function(i) {
+              return debugRec && debugRec.snaps ? (debugRec.snaps[i] || []) : [];
+            }
+          , actions : {
+                start  : runStepThrough
+                // Opt-in deferred recording; see runStepThrough's `defer`.
+              , startDeferred : function() { runStepThrough(true); }
+              , cancel : function() { debugCancelled = true; }
+              , stepTo : debugStepTo
+              , step   : function(d) { debugStepTo(debugIdx + d); }
+              , first  : function() { debugStepTo(0); }
+              , last   : function() { debugStepTo(debugRec ? debugRec.steps.length - 1 : 0); }
+              , autoStep : debugAutoStep
+              , jumpBp : debugJumpBreakpoint
+              , exit   : function() { exitReplay(); }
             }
         });
       } catch (e) {}

@@ -36,6 +36,13 @@ jobs:
       - name: trinket display hook tests (python, no deps)
         run: python test/lib/embed/test_trinket_display.py
 
+      # The step-debugger recorder's byte accounting. It runs inside Pyodide,
+      # but its payload bytes are identical on native CPython (json.dumps is
+      # deterministic), so the bound is testable here. Timing is NOT asserted:
+      # that needs Pyodide and a quiet machine, neither of which CI is.
+      - name: debug recorder byte accounting (python, no deps)
+        run: python test/lib/embed/test_debug_recorder_bytes.py
+
   test:
     runs-on: ubuntu-latest
     # Run the SAME suite on both database backends. Mongo is lenient about

@@ -445,8 +445,13 @@
           <div class="variables-toolbar-row" id="variables-toolbar-steps">
           <span id="debug-launch">
             <span id="debug-start" class="debug-btn debug-start" role="button" tabindex="0" title="Records your program running from scratch (as a standalone script — nothing carries over from earlier runs), then lets you step through it"><i class="fa fa-step-forward"></i> Step through</span>
-            <span id="debug-recording" class="hide">recording&hellip; <span id="debug-cancel" class="debug-btn" role="button" tabindex="0" title="Cancel">cancel</span></span>
           </span>
+          <!-- A SIBLING of #debug-launch, not a child. runStepThrough hides
+               #debug-launch and shows #debug-recording in the same breath
+               (pyodide.js), so while this span lived inside it, Foundation's
+               .hide on the parent won and the whole strip went blank for the
+               length of the recording -- with cancel inside the blank. -->
+          <span id="debug-recording" class="hide">recording&hellip; <span id="debug-cancel" class="debug-btn" role="button" tabindex="0" title="Cancel">cancel</span></span>
           <span id="debug-controls" class="hide">
             <span id="debug-first" class="debug-btn" role="button" tabindex="0" title="First step"><i class="fa fa-fast-backward"></i></span>
             <span id="debug-back" class="debug-btn" role="button" tabindex="0" title="Previous step (←)"><i class="fa fa-step-backward"></i></span>
@@ -456,9 +461,16 @@
             <span id="debug-last" class="debug-btn" role="button" tabindex="0" title="Last step"><i class="fa fa-fast-forward"></i></span>
             <span id="debug-prev-bp" class="debug-btn debug-bp-btn" role="button" tabindex="0" title="Previous breakpoint (Shift+←)"><i class="fa fa-chevron-circle-left"></i></span>
             <span id="debug-next-bp" class="debug-btn debug-bp-btn" role="button" tabindex="0" title="Next breakpoint (Shift+→)"><i class="fa fa-chevron-circle-right"></i></span>
-            <span id="debug-note"></span>
             <span id="debug-exit" class="debug-btn" role="button" tabindex="0" title="Exit step-through"><i class="fa fa-times"></i></span>
           </span>
+          <!-- OUTSIDE #debug-controls, which is .hide except during replay. In
+               there this span was display:none at exactly the moments it had
+               something to say: the VPython bail, the console-input bail and
+               "recording failed" are all written at recording time, so with the
+               floating panel off a student pressing "Step through" on a VPython
+               trinket got silence. Still inside #variables-toolbar, so the
+               existing descendant CSS rule keeps matching. -->
+          <span id="debug-note"></span>
           </div>
           {% endif %}
           <div class="variables-toolbar-row" id="variables-toolbar-options">
@@ -559,6 +571,12 @@
      precede the adapter, which checks for window.plotpolish at load. #}
   {% if config.features.plotStyle %}
     {% set js = js.concat(['/js/vendor/plotpolish.iife.js', '/js/plugins/plotpolish-adapter.js']) %}
+  {% endif %}
+  {# Same reasoning as the block above: appended after pyodide.js, and read only
+     from inside initialize(). Requires stepDebugger -- the panel drives that
+     debugger's own functions and has nothing to show without it. #}
+  {% if config.features.stepDebugger and config.features.debugPanel %}
+    {% set js = js.concat(['/js/plugins/debug-panel.js']) %}
   {% endif %}
   {{ cachify_js('embed-pyodide', js) | safe }}
 
