@@ -53,9 +53,25 @@ test.describe('step-through debugger', () => {
   // timeout before its own assertion ever gave up, and report as a failure
   // rather than as the slow download it is. Raise it for this block only.
   //
-  // Worth knowing: math-output.spec.js in this directory has the same shape
-  // (180 s expects under the 90 s cap) and has not hit it, because nothing
-  // has been slow enough yet. That is luck, not design.
+  // Worth knowing: this is a repo-wide shape, not a quirk of this file, and
+  // issue #302 is the sweep for it. Re-derived on feat/mpl-figures by reading
+  // each file whole -- NOT per test, because matplotlib-figures.spec.js and
+  // worker-figure-toolbar.spec.js keep their long wait in a runProgram() helper
+  // outside any test() block, which a per-test parser silently clears:
+  //
+  //   raised:     step-debugger (180 s -> 240 s),
+  //               panefit (240 s -> 360 s, two blocks at 660 s),
+  //               panefit-plotstyle (240 s -> 420 s, one test at 660 s),
+  //               worker-figsize-ratchet (240 s -> 660 s)
+  //   NOT raised: math-output (180 s), matplotlib-figures (180 s),
+  //               worker-figure-toolbar (180 s), console-status (120 s),
+  //               deploy-smoke (120 s)
+  //   marginal:   plotstyle.spec.js, largest wait exactly 90 s, i.e. the cap
+  //
+  // Those five have not hit it because nothing has been slow enough yet. That
+  // is luck, not design. math-output.spec.js is fixed on feat/mathoutput-worker
+  // (4a31d33) and still unfixed here, so expect these two branches to collide
+  // on this paragraph; the list above is the one to keep.
   test.describe.configure({ timeout: 240_000 });
 
   test.beforeEach(async ({ page }) => {

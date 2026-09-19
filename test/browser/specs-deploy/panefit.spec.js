@@ -21,6 +21,32 @@ const { test, expect } = require('@playwright/test');
 // Chrome on a retina panel -- the assertions here are written to hold at any
 // density rather than to pin one.
 
+// THE ENCLOSING TEST BUDGET. `playwright.deploy.config.js` -- the config that
+// owns this directory -- caps a test at 90_000, and every `runFigure` here waits
+// up to 240_000 for the program to finish. Without this line the TEST dies at
+// 90 s and a cold Pyodide download is reported as "the figure never appeared":
+// the assertion that names what a student did not see never gets to run.
+//
+// Never measured here, and said plainly: this suite passes under the 90 s cap on
+// a warm local stack in 2.8 minutes, slowest test 23.9 s, and a deliberate 20 s
+// cap did not kill it either. localhost serves Pyodide from cache. The 240 s
+// waits exist for the REMOTE baseURL this config actually defaults to, on a cold
+// server, which is the case no run on this machine can produce.
+//
+// 360_000 and not 240_000: the value has to EXCEED the largest assertion timeout
+// in the tests it covers, not equal it. At an equal budget the test cap fires at
+// the same instant and you get "Test timeout of 240000ms exceeded" instead of
+// the message naming the symptom -- the same defect in weak form.
+//
+// Two blocks below raise it further because they run the program TWICE, so two
+// 240 s waits can serialize inside one test. Lowering either of those back to
+// this value would put them exactly where this line found them.
+//
+// Cost: `retries: 1` makes a genuine failure cost 2x the budget. That is the
+// right trade for a suite no workflow runs (#293). Repo-wide version is #302;
+// the same fix landed on feat/mathoutput-worker in 4a31d33.
+test.describe.configure({ timeout: 360_000 });
+
 const PROG = [
   'import matplotlib.pyplot as plt',
   'import numpy as np',
@@ -94,7 +120,20 @@ test.describe('pane fit: startup', () => {
       // pixels: at dpr 2 that recomputed figsize as 9.82x7.37in and overflowed
       // every pane. It did not show at every window size, nor on main, whose
       // synchronous round trip coalesces the two resizes.
-      expect(kinds.filter(k => k === 'startup'), `one startup: ${got.classified}`).toHaveLength(1);
+      //
+      // AT LEAST one, not exactly one, and c0f671c is why. paneFitNote('startup')
+      // sits ABOVE the coalescing block (pyodide.js:4030), so every delivery in a
+      // boot burst is noted -- and the whole point of that commit is that the
+      // burst is not always a single delivery. Measured there at 1 worker load in
+      // 8; measured 0 in 8 by the round-7 coverage probe at dpr 1 headless, so it
+      // is rare rather than gone. `toHaveLength(1)` therefore went red on exactly
+      // the load the fix exists for, while a REVERT goes red on the `drag`
+      // assertion below -- a flake detector that punished the fixed behaviour.
+      // The invariant that survived c0f671c is not the note count: it is that no
+      // delivery is misread as a drag, and that awaitStartup is consumed once.
+      // Both are asserted below.
+      expect(kinds.filter(k => k === 'startup').length,
+        `at least one startup: ${got.classified}`).toBeGreaterThanOrEqual(1);
 
       // Nobody dragged anything, so nothing may be classified as a drag. A drag
       // is what recomputes figsize, and a misclassified one is the ratchet.
@@ -186,6 +225,10 @@ test.describe('pane fit: the figure gets the whole pane', () => {
 // document. The worker was unaffected -- it tore its state down per run -- so
 // this needs both runtimes to be worth anything.
 test.describe('pane fit: the second run', () => {
+  // Runs the program twice: two 240 s waits can serialize in one test, so the
+  // file-level 360_000 above is not enough here.
+  test.describe.configure({ timeout: 660_000 });
+
   for (const [label, query] of RUNTIMES) {
     test(`${label}: a re-run's figure is the one that gets fitted`, async ({ page }) => {
       await runFigure(page, query, { width: 1600, height: 900 });
@@ -429,6 +472,10 @@ test.describe('pane fit: more than one figure', () => {
 // the tight-layout patch, the nav restore, the resize echo guard and the save
 // dpi normalisation together -- they all had the same shape.
 test.describe('pane fit: after Clear memory', () => {
+  // Runs the program twice: two 240 s waits can serialize in one test, so the
+  // file-level 360_000 above is not enough here.
+  test.describe.configure({ timeout: 660_000 });
+
   test('main: the figure toolbar still works on the next run', async ({ page }) => {
     const pageErrors = [];
     page.on('pageerror', (e) => pageErrors.push(e.message));
@@ -454,16 +501,104 @@ test.describe('pane fit: after Clear memory', () => {
     await page.locator('#graphic canvas').first().waitFor({ state: 'attached', timeout: 60_000 });
     await page.waitForTimeout(4000);
 
+    // FOUR wrappers were rebound, and pressing Home exercises exactly one of
+    // them. Reverting each binding separately and re-running showed the other
+    // three breaking in ways this test could not see -- the tight-layout one
+    // worst of all, since it raises inside every Figure.draw rather than on a
+    // button. So: Home, then a corner drag (the resize wrapper, and a draw,
+    // which is what reaches the layout engine), then Download (the save
+    // wrapper). All three surface a Python failure the same way, through
+    // webagg's on_message handler, as an unhandled page error.
+    //
+    // The fifth binding, `_dpi=_trinket_savefig_dpi`, is deliberately NOT
+    // pinned: that helper is defined OUTSIDE the `_trinket_savedpi_patched`
+    // guard, so it is redefined on every setup run and survives a clear for
+    // free. The other four live inside guarded blocks that the second run
+    // skips, which is precisely why they needed binding.
     const pressed = await page.evaluate(() => {
       const b = document.querySelector('#graphic button[title*="Reset"], #graphic .mpl-toolbar button');
+      if (!b) return null;
+      b.click();
+      return b.title || '(untitled)';
+    });
+    // Asserted, not assumed: the fallback selector is "the first toolbar
+    // button", which is Home only because matplotlib happens to order it first.
+    // Without this the test could press Pan and assert nothing.
+    expect(pressed, 'pressed Home').toContain('Reset');
+    await page.waitForTimeout(2000);
+
+    // A real corner drag. It has to be SLOW -- a hold, then small steps -- or
+    // the native resizer never engages and the test measures nothing: a first
+    // attempt with four fast steps produced zero `drag` entries in the
+    // classifier log and looked like a pass.
+    const corner = await page.evaluate(() => {
+      const r = document.querySelector('#graphic canvas').parentNode.getBoundingClientRect();
+      return { x: Math.round(r.right - 5), y: Math.round(r.bottom - 5) };
+    });
+    await page.mouse.move(corner.x, corner.y);
+    await page.mouse.down();
+    await page.waitForTimeout(150);
+    for (let k = 1; k <= 6; k++) {
+      await page.mouse.move(corner.x - 4 * k, corner.y - 3 * k);
+      await page.waitForTimeout(40);
+    }
+    await page.mouse.up();
+    await page.waitForTimeout(2000);
+    expect(await page.evaluate(() => window.__trinketPaneFit.classified.some(e => e.kind === 'drag')),
+      'the corner drag landed').toBe(true);
+
+    // Download. The wrapper normalises savefig.dpi for the duration of the
+    // call and puts it back; it calls through to the wheel's own handle_save
+    // on every path, so a plain Download exercises it.
+    const saved = await page.evaluate(() => {
+      const b = document.querySelector('#graphic button[title*="Download"]');
       if (!b) return false;
       b.click();
       return true;
     });
-    expect(pressed, 'the figure has a Home button').toBe(true);
+    expect(saved, 'the figure has a Download button').toBe(true);
     await page.waitForTimeout(2500);
 
     expect(pageErrors.filter(m => /NameError/.test(m)),
       `Python raised into the page: ${pageErrors.join(' | ')}`).toHaveLength(0);
   });
+});
+
+// A gesture the browser abandons. `pointercancel` is what a touch device sends
+// when scrolling takes over mid-drag, and there is no `pointerup` behind it: the
+// classifier's pointerDown flag stayed true for the life of the figure and every
+// later fit was deferred and never sent, so the figure stopped following the
+// pane silently -- a deferred fit logs nothing.
+//
+// Synthetic PointerEvents are enough here because the flag is set and cleared by
+// listeners, not by the native resizer: what is under test is the teardown, not
+// a real drag.
+test.describe('pane fit: a cancelled gesture', () => {
+  for (const [label, query] of RUNTIMES) {
+    test(`${label}: a cancelled pointer does not strand the figure`, async ({ page }) => {
+      await runFigure(page, query, { width: 1500, height: 760 });
+
+      await page.evaluate(() => {
+        const div = document.querySelector('#graphic canvas').parentNode;
+        const opts = { bubbles: true, composed: true, pointerId: 1, pointerType: 'touch', isPrimary: true };
+        div.dispatchEvent(new PointerEvent('pointerdown', opts));
+        div.dispatchEvent(new PointerEvent('pointercancel', opts));
+      });
+      await page.waitForTimeout(300);
+
+      // The symptom first, the mechanism after -- this file's rule. With the
+      // flag stranded this fit is deferred and never sent, and the figure
+      // overflows its pane by the whole difference: measured 562x421 in a
+      // 460x385 box on both runtimes. Checking pointerDown first would
+      // short-circuit the test and never assert what a student sees.
+      await page.setViewportSize({ width: 1150, height: 760 });
+      await page.waitForTimeout(4000);
+
+      const got = await readProbe(page);
+      expect(got.canvas.w, `figure ${got.canvas.w} in a ${got.probe.box.w} pane`)
+        .toBeLessThanOrEqual(got.probe.box.w + 1);
+      expect(got.probe.deferred, 'no fit is left deferred').toBe(false);
+      expect(got.probe.pointerDown, 'the cancel cleared the gesture').toBe(false);
+    });
+  }
 });

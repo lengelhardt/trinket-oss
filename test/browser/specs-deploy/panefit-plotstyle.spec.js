@@ -90,6 +90,37 @@ function readProbe(page, py) {
 }
 
 test.describe('pane fit + plot style panel', () => {
+  // See the long note in panefit.spec.js. Same defect, same reason: the config
+  // that owns this directory caps a test at 90_000 while runFigure waits up to
+  // 240_000.
+  //
+  // 420_000 for the block, and 660_000 raised on ONE test below. Only 'worker:
+  // the panel re-run comes back fitted' runs the program twice -- runFigure's
+  // 240 s wait, then another for the panel's own re-run -- so only that test can
+  // serialize two long waits. A single 660 s block handed the other four 270 s
+  // of headroom they cannot use and doubled their exposure to an unbounded step
+  // (see below) from 6 minutes to 11, again under `retries: 1`.
+  //
+  // 420 and not 360. The budget has to exceed the SERIALIZED TOTAL, not the
+  // largest single assertion -- that distinction is the whole point of splitting
+  // and an earlier version of this comment got it wrong, shipping 360 while the
+  // derivation that produced it printed 384-390:
+  //
+  //   runFigure HERE = 240 (console poll) + 60 (canvas attached)
+  //                  + 60 (plotpolish-panel attached) + 4 (settle)
+  //                  + 20 (the config's default expect, on .ace_editor)  = 384 s
+  //   + 6 s of per-test settles in two of them                           = 390 s
+  //
+  // The extra 60 s is the `plotpolish-panel` waitFor, which panefit.spec.js's
+  // runFigure does not have -- which is exactly why 360 is enough there and not
+  // here. 420 clears 390 with 30 s of margin and still cuts four tests from 11
+  // minutes to 7, which was the entire point.
+  //
+  // This is NOT "lower the block and leave long assertions in it", the mistake
+  // refuted by measurement on feat/mathoutput-worker: the test with two long
+  // waits keeps the full 660 s.
+  test.describe.configure({ timeout: 420_000 });
+
   // 1700x760 is deliberate: it is a shape where HEIGHT binds, so the fit gives
   // the figure the whole pane and there is no slack left to absorb anything.
   for (const [label, query] of [['worker', '?runtime=worker'], ['main', '?runtime=main']]) {
@@ -205,6 +236,8 @@ test.describe('pane fit + plot style panel', () => {
   });
 
   test('worker: the panel re-run comes back fitted', async ({ page }) => {
+    // The only test here that runs the program twice; see the block note above.
+    test.setTimeout(660_000);
     await skipUnlessPlotStyle(page);
     await runFigure(page, '?runtime=worker', { width: 1280, height: 900 });
     const before = await readProbe(page);

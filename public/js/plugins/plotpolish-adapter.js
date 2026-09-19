@@ -254,11 +254,12 @@
     //
     // Fired through jQuery on #editor rather than by clicking `a.run-it`:
     // that is exactly what this embed's own Ctrl-Enter/Cmd-Enter run command
-    // does (pyodide.js:4830), and the document-level handler beside it
-    // (pyodide.js:4835) is what turns the event into a run, via showResult ->
-    // runCode. So a re-run from here inherits runCode's guards -- it is
-    // ignored while a step-through recording is in flight and while an
-    // ordinary run is still going (pyodide.js:4329) -- rather than simulating
+    // does (pyodide.js:5566, the editor's `run` command), and the
+    // document-level handler beside it (pyodide.js:5571) is what turns the
+    // event into a run, via showResult -> runCode. So a re-run from here
+    // inherits runCode's guards -- it is ignored while a step-through
+    // recording is in flight (pyodide.js:5064) and while an ordinary run is
+    // still going (pyodide.js:5066) -- rather than simulating
     // a click on a control that may be hidden, mid-run or replaced by Stop.
     panel.addEventListener('plotpolish-rerun-requested', function() {
       try {
