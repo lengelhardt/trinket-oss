@@ -271,6 +271,19 @@
       return displayLoading;
     }
 
+    // Memoized, so only the first caller in a flag-on worker pays the fetch; an
+    // empty displayUrl is the flag being off and skips it entirely.
+    //
+    // Module scope, not local to run(), because the REPL needs it too: the main
+    // thread installs the helper during its boot, ahead of the Clear-memory
+    // snapshot, so `display` is a builtin before the student has pressed
+    // anything. A worker that installed only inside run() left the console
+    // raising NameError until the first Run, and `Clear memory` put a student
+    // who had been using the feature straight back into that state.
+    function prepareDisplay() {
+      return displayUrl ? ensureDisplay(displayUrl) : Promise.resolve();
+    }
+
     // The worker's half of the page's runProgram().
     //
     // `src` is what executes — already async-transformed where that applies.
@@ -679,6 +692,29 @@
 
     function pushRepl(msg) {
       currentRunId = msg.id;
+      // The display helper must be installed before the statement is evaluated,
+      // not only before a Run: on the main thread `display` is a builtin from
+      // boot, so typing display(Integral(x)) at a fresh prompt works there and
+      // raised NameError here. prepareDisplay is memoized, so only the first
+      // statement of a flag-on worker waits on the fetch, and a failed load
+      // resolves rather than rejects -- the console still evaluates, with the
+      // same NameError the main thread gives when its own install failed.
+      //
+      // Bare expressions are NOT affected either way: measured on 2026-09-18,
+      // `Integral(x, x)` at the prompt prints plain repr on BOTH runtimes,
+      // because the hook wraps module-level statements in run_program and the
+      // REPL does not go through it. Only display() differs, and only here.
+      // Both arms evaluate. A failed install must not stop the statement
+      // running -- the student loses typeset output, not their console. Stated
+      // HERE rather than relied on from ensureDisplay's catch 400 lines away:
+      // without the second arm a rejected promise posts neither `done` nor
+      // `error`, and the console is dead with no message and no prompt. run()'s
+      // chain already ends in a catch for the same reason.
+      prepareDisplay().then(function() { evaluateRepl(msg); },
+                            function() { evaluateRepl(msg); });
+    }
+
+    function evaluateRepl(msg) {
       var console_;
       try {
         console_ = ensureReplConsole();
@@ -749,11 +785,22 @@
           })
         : Promise.resolve(source); };
 
-      // Memoized, so only the first run of a flag-on worker pays the fetch; an
-      // empty displayUrl is the flag being off and skips it entirely.
-      var prepareDisplay = function() {
-        return displayUrl ? ensureDisplay(displayUrl) : Promise.resolve();
-      };
+      // A VPython run is not routed through the AST WRAP, matching runVpython()
+      // on the page (pyodide.js), which says so in as many words: typeset
+      // output covers the plain run and worker paths in slice 1 only. Without
+      // this the worker wrapped module-level expressions on top of the vpython
+      // async transform while the main thread did not.
+      //
+      // The WRAP only. prepareDisplay() below stays unconditional, because it
+      // does two separable things: it installs builtins.display, and it flips
+      // displayReady so runProgram() applies the wrap. Gating both removed
+      // `display` from VPython programs entirely -- and the main thread installs
+      // at boot for every run, VPython included, so that was a NameError on one
+      // runtime and a rendered card on the other. It is not rescued by an
+      // earlier plain run in the same worker: the page calls discardWorker()
+      // for every worker VPython run (worker-client.js), so msg.vpython is true
+      // on the first run of that worker, always.
+      var wantsWrap = !msg.vpython;
 
       var mpl = usesMatplotlib(source);
 
@@ -784,7 +831,10 @@
                        : src;
           });
         })
-        .then(function(src) { return runProgram(src, source); })
+        .then(function(src) {
+          return wantsWrap ? runProgram(src, source)
+                           : pyodide.runPythonAsync(src);
+        })
         .then(function() {
           return mpl ? pyodide.runPythonAsync(MPL_FLUSH) : null;
         })

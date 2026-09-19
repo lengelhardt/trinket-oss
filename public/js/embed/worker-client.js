@@ -45,15 +45,22 @@
       if (msg.type === 'stdout') { if (opts.onStdout) opts.onStdout(msg.text); return; }
       if (msg.type === 'stderr') { if (opts.onStderr) opts.onStderr(msg.text); return; }
 
-      // One typeset result (features.mathOutput). Streaming and UNSCOPED, like
-      // stdout and unlike `figure`, because that is what keeps it ordered: the
-      // page queues cards and program text in the same buffer, so the only thing
-      // that preserves program order is delivering them in the order the worker
-      // posted them. A run-scoped check would drop a card the moment settle()
-      // nulled `current`, which is exactly the bug the figure comment above
-      // describes. A replaced worker can therefore emit a late card, the same
-      // way it can emit late stdout.
-      if (msg.type === 'rich')   { if (opts.onRich)   opts.onRich(msg.json); return; }
+      // One typeset result (features.mathOutput). Scoped to the LIVE WORKER,
+      // like `figure` below and unlike `current`-scoped messages.
+      //
+      // Run scoping would be wrong here for the reason the figure comment
+      // spells out: settle() nulls `current` when the program ends, so a card
+      // still in flight would be dropped. Worker scoping costs nothing that
+      // run scoping costs. Ordering against the text stream is untouched,
+      // because a single worker's messages arrive in the order it posted them
+      // and the page queues cards and program text in one buffer. What it buys
+      // is that a card posted in the instant before a Stop cannot land in the
+      // NEXT run's console, which is exactly what `figure` guards against.
+      if (msg.type === 'rich') {
+        if (e.target !== worker) return;
+        if (opts.onRich) opts.onRich(msg.json);
+        return;
+      }
 
       // input() cannot block in a worker — there is no SharedArrayBuffer in an
       // embed, so Atomics.wait is unavailable. The worker suspends on a promise
