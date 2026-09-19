@@ -28,6 +28,11 @@ const { test, expect } = require('@playwright/test');
 //
 // The skip below is about the TOOLBAR (#280), which only the worker's manager
 // lacked; both runtimes set figure.autolayout and both had the #283 drift.
+//
+// Read that as a statement about the CODE, not about this file's scope: the
+// skip at :99 means only the worker is ever exercised here, so the main
+// thread's #283 fix is asserted by nothing. Deliberate, not an oversight --
+// see R7-C2 in harness/panefit-coverage-round7.md.
 
 const PROG = 'import matplotlib.pyplot as plt\nplt.plot([0,1,2,3],[0,1,4,9])\nplt.show()\nprint("FINI")\n';
 
