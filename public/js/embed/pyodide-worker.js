@@ -751,8 +751,13 @@
             // once, before the program ran. The pane is now fitted by scaling
             // figure.dpi after the figure exists (handle_trinket_pane_fit in
             // MPL_SETUP), so the size is a fixed rcParam and the pane no longer
-            // reaches into it. graphicWidth is still sent -- the page uses it
-            // for the first fit -- but nothing in here reads it.
+            // reaches into it.
+            //
+            // graphicWidth is still SENT and is read by nobody, here or on the
+            // page. This comment used to say "the page uses it for the first
+            // fit"; it does not -- the page's first measurement is paneFitBox(),
+            // reading the DOM live. See the longer note at the point it is
+            // computed, pyodide.js:5153.
             if (mpl) { installDomStubs(); }
             return mpl ? pyodide.runPythonAsync(MPL_SETUP).then(function() { return src; })
                        : src;

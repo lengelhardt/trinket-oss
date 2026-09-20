@@ -124,7 +124,7 @@ test.describe('pane fit: startup', () => {
       // THERE IS DELIBERATELY NO ASSERTION ON THE STARTUP-NOTE COUNT. This used
       // to be `toHaveLength(1)`, and c0f671c made that false:
       // paneFitNote('startup') sits ABOVE the coalescing block
-      // (pyodide.js:4030), so every delivery in a boot burst is noted, and the
+      // (pyodide.js:4052), so every delivery in a boot burst is noted, and the
       // point of that commit is that the burst is not always one delivery. So
       // the old assertion went red on exactly the load the fix exists for,
       // while a REVERT goes red on the `drag` assertion below -- a flake
@@ -132,7 +132,7 @@ test.describe('pane fit: startup', () => {
       //
       // Weakening it to `toBeGreaterThanOrEqual(1)` was the first repair and it
       // was a tautology: `awaitStartup = false` is written at exactly one place
-      // (pyodide.js:4115), inside the rAF callback, which is only ever scheduled
+      // (pyodide.js:4168), inside the rAF callback, which is only ever scheduled
       // from the branch whose first statement IS paneFitNote('startup'). So
       // awaitStartup === false implies at least one startup note, and that is
       // asserted below.
@@ -627,6 +627,166 @@ test.describe('pane fit: a cancelled gesture', () => {
         .toBeLessThanOrEqual(got.probe.box.w + 1);
       expect(got.probe.deferred, 'no fit is left deferred').toBe(false);
       expect(got.probe.pointerDown, 'the cancel cleared the gesture').toBe(false);
+    });
+  }
+});
+
+test.describe('pane fit: the output tab goes away and comes back', () => {
+  // THE RE-SHOW BRANCH (pyodide.js:4269), which shipped in 7d57c8f with no test.
+  //
+  // Hiding the output pane drives canvas_div to 0x0. mpl.js suppresses that
+  // delivery itself -- it gates on `width != 0 && height != 0` -- so nothing
+  // reaches the classifier. Showing the pane again resets the bitmap and
+  // re-delivers the SAME size as before the hide. Without a branch for it that
+  // delivery is handled as an ordinary one, and the student is left looking at
+  // a blank figure: two clicks and the plot is gone.
+  //
+  // WHAT DETECTS IT, AND IT IS NOT THE CLASSIFICATION. Measured by deleting the
+  // branch from the served tree: the re-delivery is classified `echo`, not
+  // `drag`, on BOTH runtimes -- so a test asserting "nothing was read as a
+  // drag" passes with the bug present. The observable is the figure itself.
+  //
+  //   with the branch      ink 196992, 196992, 196992   reshow:513x384 each time
+  //   branch deleted       ink 196992, 0, 0             echo:513x384 each time
+  //
+  // Hence `ink`: a count of non-transparent pixels on the mpl canvas, which a
+  // reset bitmap reads as exactly 0. Symptom first; the reshow note is asserted
+  // second, as the mechanism behind it.
+  //
+  // TWICE, not once. The shipped behaviour before 7d57c8f ALTERNATED between
+  // ratcheting and blanking, so a single switch can land on the good half of an
+  // alternation and report nothing wrong.
+  //
+  // THIS TEST PINS THE BRANCH'S PLACEMENT AS WELL AS ITS EXISTENCE, and an
+  // earlier version of this comment claimed it did not. Moving the block below
+  // the echo branch and running this test unmodified gives ink 196992 -> 0 at
+  // the first tab switch on both runtimes -- identical to deleting the branch.
+  // The reason is that an ordinary re-show has no gesture behind it, so
+  // seq === seqAtFit and the echo branch would catch the re-delivery first,
+  // mark it trinket_fit_echo and have Python drop it.
+  //
+  // The claim that it was unpinnable came from one measurement that began with
+  // a CORNER DRAG -- the single path where seq !== seqAtFit, so the echo branch
+  // does not catch it and the move really is harmless. Generalising from the
+  // narrow case to the common one is the whole of that error, and the data
+  // refuting it was already in this file's own mutation run.
+  //
+  // WHAT EACH ASSERTION BELOW PINS, since the three mechanisms in that branch
+  // are separable and two earlier versions of this comment ran them together:
+  // the ink pins the branch EXISTING and sending refresh; the reshow count
+  // plus the ink pin its PLACEMENT above the echo branch; and the total note
+  // count pins the `return`, which nothing else here can see.
+  //
+  // ONE THING IS NOT PINNED AND CANNOT BE. That a re-show must not update
+  // `lastDelivered` is unobservable from outside: the branch only fires when
+  // lastDelivered already equals the delivered size, and nothing can mutate st
+  // between the comparison and the assignment, so assigning would write the
+  // value it holds. That is a no-op rather than a mechanism.
+
+  test.describe.configure({ timeout: 360_000 });
+
+  for (const [label, query] of RUNTIMES) {
+    test(`${label}: switching the output tab away and back leaves the figure drawn`, async ({ page }) => {
+      await runFigure(page, query, { width: 1280, height: 900 });
+
+      const ink = () => page.evaluate(() => {
+        const c = document.querySelector('#graphic canvas.mpl-canvas')
+               || document.querySelector('#graphic canvas');
+        const d = c.getContext('2d').getImageData(0, 0, c.width, c.height).data;
+        let n = 0;
+        for (let i = 3; i < d.length; i += 4) if (d[i] !== 0) n++;
+        return n;
+      });
+      const notes = () => page.evaluate(() =>
+        window.__trinketPaneFit.classified.map(e => `${e.kind}:${e.w}x${e.h}`));
+
+      // VACUITY GUARD. Everything below compares against a figure that was
+      // drawn in the first place; if the run produced an empty canvas, "still
+      // blank" and "blanked by the switch" are the same number. Measured at
+      // 196992 non-transparent pixels for this program at this viewport, so the
+      // bar is set well under that rather than at `> 0`, which a stray
+      // antialiased edge could satisfy.
+      //
+      // WHY THE COMPARISON BELOW IS EXACT AND NOT A FLOOR. Agg is a
+      // deterministic software rasteriser and the re-show path re-renders an
+      // unchanged figure at an unchanged dpi, so the two bitmaps should be
+      // byte-identical rather than merely close -- exact equality is the
+      // stronger assertion and it is not a flake risk. What WOULD make it flake
+      // is anything that changes the BOX across the switch, since that is a
+      // real re-fit and a different render; the known candidate is scrollbar
+      // behaviour off macOS, which is reasoned rather than measured on this
+      // branch. If this ever goes red with a non-zero received value, suspect
+      // the box, not the rasteriser -- the `added` notes in the message say
+      // which.
+      const drawn = await ink();
+      expect(drawn, 'the figure was drawn before any tab switch').toBeGreaterThan(10_000);
+
+      // The canvas box, captured so the assertion below can say WHICH thing
+      // moved. This is a diagnostic precondition, not a detector: on this
+      // machine it never fires, because macOS uses overlay scrollbars and the
+      // box cannot move across a tab switch.
+      const boxOf = () => page.evaluate(() => {
+        const c = document.querySelector('#graphic canvas.mpl-canvas')
+               || document.querySelector('#graphic canvas');
+        return c.clientWidth + 'x' + c.clientHeight;
+      });
+      const box0 = await boxOf();
+
+      for (const pass of [1, 2]) {
+        const before = (await notes()).length;
+        await page.evaluate(() => { $(document).trigger('trinket.instructions.view'); });
+        await page.waitForTimeout(1200);
+        await page.evaluate(() => { $(document).trigger('trinket.output.view'); });
+        await page.waitForTimeout(2500);
+        const added = (await notes()).slice(before);
+
+        // THE BOX FIRST, so a scrollbar cannot be mistaken for a blank.
+        // `#graphic-wrap` is `overflow: auto` (static/scss/embed/_python.scss:180),
+        // so on a CLASSIC-scrollbar platform -- Windows, most Linux -- showing
+        // a long Instructions pane can change the available client width, and
+        // then a CORRECT re-fit produces a different bitmap. Without this line
+        // that lands as "the tab switch blanked the figure", which is the
+        // wrong diagnosis and would send the next reader after the classifier
+        // instead of after the layout.
+        //
+        // It cannot fire here: macOS uses overlay scrollbars, so the box does
+        // not move. That is exactly why it is worth writing down -- the
+        // scrollbar behaviour of other platforms is reasoned on this branch,
+        // not measured, and this is where that assumption would first bite.
+        expect(await boxOf(),
+          `pass ${pass}: the tab switch changed the canvas box, so the ink comparison below is not meaningful -- suspect scrollbar geometry, not the classifier. Notes: ${added.join(' ')}`)
+          .toBe(box0);
+
+        // SYMPTOM: what the student sees. Exactly the ink it had -- the
+        // figure is neither blanked nor redrawn at a different size.
+        expect(await ink(), `pass ${pass}: the tab switch blanked the figure. Notes: ${added.join(' ')}`)
+          .toBe(drawn);
+
+        // MECHANISM SECOND: the re-delivery took the reshow branch. Without
+        // this the test still catches a deleted branch via the ink, but it
+        // would not catch the branch being reached by some other route, and
+        // the failure message would not say what broke.
+        expect(added.filter(s => s.startsWith('reshow')).length,
+          `pass ${pass}: the re-show was not classified as one. Notes: ${added.join(' ')}`)
+          .toBe(1);
+
+        // EXACTLY ONE NOTE, which pins the branch's `return` and nothing else
+        // does. Deleting the return does NOT blank the figure -- `refresh` is
+        // sent on the line BEFORE it (pyodide.js:4274), so Python has already
+        // been told to repaint -- control simply falls through and the same
+        // delivery is noted a second time as an echo. Measured with the return
+        // deleted: ink 196992 unchanged, reshow count still 1, notes
+        // `reshow:513x384 echo:513x384`, both runtimes. So the ink assertion
+        // and the reshow count are both green and only the total catches it.
+        //
+        // It earns its place twice: it also turns a real fit arriving during
+        // the switch into a failure that says a third size appeared, rather
+        // than into `the tab switch blanked the figure`, which would be the
+        // wrong diagnosis.
+        expect(added.length,
+          `pass ${pass}: the re-show produced more than one note. Notes: ${added.join(' ')}`)
+          .toBe(1);
+      }
     });
   }
 });

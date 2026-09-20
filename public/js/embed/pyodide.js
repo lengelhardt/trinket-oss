@@ -3868,6 +3868,28 @@ function paneFitBox(fig) {
   return { w: w, h: h, dpr: window.devicePixelRatio || 1 };
 }
 
+// The identity of a DELIVERY, used only by the re-show test. CSS size alone is
+// not enough: paneFit's own signature is `w x h @ dpr` (see paneFit below) and
+// Python applies that dpr to figure.dpi, so two deliveries can carry identical
+// CSS dimensions and mean different things. Comparing CSS only would let a
+// genuine fit echo across a dpr change be read as a re-show, refreshed rather
+// than applied, and the new dpi silently dropped.
+//
+// Reachability is narrow and is NOT the reason this is here: a dpr change that
+// leaves the fitted CSS size untouched produces no ResizeObserver delivery at
+// all, so the branch is not obviously entered. The reason is that the two
+// identities have to agree. One of them including dpr and the other not is the
+// kind of asymmetry that is correct today by accident and wrong after the next
+// edit, and it cost a reviewer a finding to notice.
+//
+// Narrowing only: this can make FEWER deliveries count as re-shows, never
+// more, so it cannot reintroduce the ratchet. The one thing it could cost is a
+// missed re-show, which needs an actual dpr change between two consecutive
+// deliveries of the same CSS size.
+function paneFitDeliveryId(w, h) {
+  return w + 'x' + h + '@' + (window.devicePixelRatio || 1);
+}
+
 // `fromChromeRefit` is set only by the echo branch's chrome re-measure. Every
 // other caller is a NEW reason to fit -- a window resize, a drag's flush, a
 // probe -- and refills the refit budget; a chrome refit must not refill the
@@ -4028,6 +4050,7 @@ function armPaneFitClassifier() {
     // drag: figsize 4.8x3.6 -> 9.82x7.37 in, floored, overflowing every pane.
     if (st && st.awaitStartup) {
       paneFitNote('startup', w, h);
+      st.lastDelivered = paneFitDeliveryId(w, h);
       try { fig.send_message('resize', { width: w, height: h, trinket_fit_echo: true }); } catch (e) {}
       // The boot burst is not always ONE delivery. Most loads deliver a single
       // startup resize (the div going from the canvas's 300x150 default to the
@@ -4064,7 +4087,7 @@ function armPaneFitClassifier() {
       // a backgrounded tab, so this is a real condition, not an invented one.
       //
       // WHAT MAKES IT HARMLESS IS NOT THIS BLOCK. It is paneFit's box-signature
-      // skip (`if (sig === st.lastBoxSig) return;`, pyodide.js:3915): of those
+      // skip (`if (sig === st.lastBoxSig) return;`, pyodide.js:3937): of those
       // 13 paneFit calls, 1 sent and 12 were
       // dropped because the box had not moved. Final state was correct on both
       // runtimes -- canvas 513 inside box 513, pendingFits 0, zero drags. An
@@ -4077,8 +4100,22 @@ function armPaneFitClassifier() {
       // RESIDUAL, read not measured: those 12 were dropped because the box was
       // constant. A pane genuinely moving while backgrounded gives each late
       // delivery a different box, so each one sends -- N late deliveries, N Agg
-      // renders. pendingFits caps the counter, not the sends. That is cost, not
-      // correctness, and nothing here addresses it.
+      // renders. pendingFits caps the counter, not the sends.
+      //
+      // THAT IS COST RATHER THAN CORRECTNESS ONLY SINCE 7d57c8f, and the
+      // distinction is the whole history of this file. When this sentence was
+      // first written (270d56f) it was FALSE: the classifier still read
+      // `pendingFits > 0`, so a capped counter with three fits in flight had
+      // the third echo classified a drag and figsize recomputed -- capping the
+      // counter while sending unconditionally was the ratchet, not a cost.
+      // 7d57c8f made the sentence true by taking the count out of the
+      // discriminator, and did not come back to reword it.
+      //
+      // So do not read this as a general principle. A capped counter is only
+      // harmless while NOTHING DECIDES ANYTHING ON IT. If any future reader
+      // reintroduces a count into the classifier, this paragraph goes back to
+      // being wrong. Covered by the three-fit test in
+      // test/browser/specs-deploy/worker-figsize-ratchet.spec.js.
       //
       // So still no guard, but for a narrower reason than the one given before:
       // a guard would have to tell a burst delivery from a late one, which is
@@ -4137,8 +4174,129 @@ function armPaneFitClassifier() {
       }, 50);
       return;
     }
-    if (st && st.pendingFits > 0 && st.seq === st.seqAtFit) {
-      st.pendingFits -= 1;
+    // A DELIVERY EQUAL TO THE PREVIOUS ONE IS A RE-SHOW, NOT A SIZE CHANGE.
+    //
+    // Hiding the output pane (the Instructions and Variables tabs, and the
+    // narrow-width editor toggle, all add `hide` to #outputContainer) drives
+    // canvas_div to 0x0; showing it drives it back. mpl.js RESETS THE CANVAS
+    // BITMAP on the way back -- setAttribute('width', ...) in its observer
+    // handler -- and then calls request_resize with the size it already had.
+    // No pointer, nothing in flight.
+    //
+    // Untreated that is a one-click student-visible bug on both runtimes,
+    // measured: the figure alternates between ratcheting (the delivery is read
+    // as a drag, figsize 3.6 -> 3.59 in, repainted) and going BLANK (read as an
+    // echo, which Python drops, so the reset bitmap is never repainted). Two
+    // clicks on the output tab and the figure is gone.
+    //
+    // WHY DROPPING IT IS SAFE, and the obvious argument for this is WRONG.
+    // "ResizeObserver only reports changes, so two equal deliveries cannot both
+    // be real" is false: mpl.js suppresses deliveries of its own, gating on
+    // `width != 0 && height != 0`, so the hide (to 0x0) is swallowed and the
+    // show arrives looking identical to what came before. Hide/show MID-DRAG
+    // demonstrates it -- a genuine drag delivery followed by an equal one:
+    //
+    //   drag:509x381 ... drag:489x366  reshow:489x366  echo:513x383
+    //
+    // The argument that does hold is about information, not about counting:
+    // two consecutive deliveries can only be equal if something between them
+    // was suppressed, so the PREDECESSOR carried the identical size and already
+    // told Python everything this one would. Dropping it loses nothing. That
+    // also covers dpr 2, where two device sizes can round to one CSS size --
+    // the information went in the rounding, not here.
+    //
+    // It relies on lastDelivered describing a REAL delivery, which is why a
+    // reshow returns without updating it.
+    //
+    // THREE SEPARATE THINGS, and two earlier versions of this comment merged
+    // them. Written out because each is pinned by something different, and one
+    // is not pinned at all:
+    //
+    //   (a) The branch EXISTING and sending `refresh` is what prevents the
+    //       blank. Delete the whole block and the tab switch leaves ink 0 on
+    //       both runtimes.
+    //   (b) Its placement ABOVE THE ECHO BRANCH is what stops the echo branch
+    //       getting there first. See below.
+    //   (c) The `return` prevents only a SPURIOUS SECOND CLASSIFICATION. It is
+    //       not what prevents the blank, because `refresh` is sent on the line
+    //       before it -- Python has already been told to repaint, so control
+    //       falling through changes nothing a student sees. Measured, return
+    //       deleted: ink 196992 unchanged, notes `reshow:513x384
+    //       echo:513x384`, both runtimes. Harmless since 7d57c8f demoted
+    //       pendingFits out of the classifier; it would not have been before.
+    //
+    // The non-assignment of lastDelivered is a no-op and not a mechanism at
+    // all: the branch only fires when lastDelivered already equals
+    // paneFitDeliveryId(w, h), and nothing can mutate st between the
+    // comparison and the assignment, so assigning would write the value it
+    // holds.
+    //
+    // ABOVE THE ECHO BRANCH, which matters more than being above the drag
+    // branch and is the part two earlier versions of this comment got wrong.
+    //
+    // For an ordinary re-show -- no gesture, which is the common case -- the
+    // state is seq === seqAtFit, so if this test sat below the echo branch the
+    // echo branch would catch the re-delivery first, mark it trinket_fit_echo,
+    // and Python would drop it: nothing repaints and the figure is BLANK.
+    // Measured, block moved below the echo branch and the re-show test run
+    // unmodified: ink 196992 -> 0 at the first tab switch, both runtimes,
+    // identical to deleting the branch outright.
+    //
+    // A previous version of this comment claimed the opposite -- that moving it
+    // down was behaviourally identical and only "below the drag note" broke
+    // anything. That was generalised from a single measurement that began with
+    // a CORNER DRAG, the one path where seq !== seqAtFit and the echo branch
+    // therefore does not catch it. The drag case is the narrow one; the no-drag
+    // case is the common one, and it is the one that blanks.
+    //
+    // AND THE ORIGINAL COMMENT'S CASE WAS REAL -- reinstated here, because it
+    // was described in 7d57c8f, wrongly denied in e7dd94d, and then dropped
+    // rather than corrected in fd5fbf7. Below the DRAG NOTE the failure
+    // depends on gesture state: an ordinary re-show blanks, as above, but a
+    // re-show following a drag whose pointerup fit was SKIPPED by the
+    // box-signature check has seq !== seqAtFit, misses the echo branch,
+    // reaches the drag note, and sends an unmarked resize -- handle_resize
+    // then recomputes figsize, which ratchets. Two different failures from one
+    // mis-ordering, and the narrow one is the one that corrupts the download.
+    //
+    // "Above the echo branch" is still the complete rule, because the echo
+    // branch is the only code between this test and the drag note, so nothing
+    // can satisfy the weaker constraint and violate the stronger one.
+    //
+    // Pinned by the re-show test in test/browser/specs-deploy/panefit.spec.js,
+    // which measures the FIGURE rather than the classification -- a
+    // mis-ordered branch is still classified `echo`, not `drag`.
+    if (st && st.lastDelivered === paneFitDeliveryId(w, h)) {
+      paneFitNote('reshow', w, h);
+      // mpl.js's own refresh: Python sets _force_full and draw_idle ships a
+      // fresh image. One Agg render, on a path where the figure is being looked
+      // at again.
+      try { fig.send_message('refresh', {}); } catch (e) {}
+      return;
+    }
+    if (st) st.lastDelivered = paneFitDeliveryId(w, h);
+    // GESTURE, NOT COUNT. This used to require `st.pendingFits > 0`, and the
+    // count cannot answer the question being asked. paneFit caps it at 2 and
+    // sends unconditionally, so with three fits in flight the third echo
+    // arrived at 0 and was classified a drag -- the ratchet this file exists to
+    // prevent, measured at 4.8x3.6 in -> 4.8x3.5933 in. Removing the count from
+    // the condition also removes the stall that gating the SEND would cause,
+    // because nothing here gates the send.
+    //
+    // `st.seq === st.seqAtFit` means no gesture has begun since we last asked
+    // Python for a size, and an interlock makes that exact: paneFit returns at
+    // `if (st.pointerDown)` BEFORE it stamps seqAtFit, and the one pointerdown
+    // listener sets `st.seq++; st.pointerDown = true;` in a single synchronous
+    // statement -- so no fit can stamp seqAtFit mid-gesture.
+    //
+    // The cost, owned rather than inherited: a delivery with no gesture behind
+    // it is now ALWAYS treated as ours, where the stale count used to let one
+    // through. Anything resizing canvas_div without a pointer stops reaching
+    // Python. That is the right answer for a resize nobody gestured at.
+    //
+    // pendingFits survives as bookkeeping and for the probe, not as a decision.
+    if (st && st.seq === st.seqAtFit) {
+      if (st.pendingFits > 0) st.pendingFits -= 1;
       paneFitNote('echo', w, h);
       // Marked so Python drops it instead of recomputing figsize from twice-
       // truncated pixels -- which is the ratchet: measured 4.66 in -> 4.5682 in
@@ -4230,6 +4388,7 @@ function registerPaneFit(fig) {
   var st = paneFitState[fig.id] = {
     fig: fig, generation: mplGeneration,
     seq: 0, seqAtFit: -1, pendingFits: 0, awaitStartup: true, lastBoxSig: null,
+    lastDelivered: null,
     chromeAtFit: null, chromeRefits: 0, startupTimer: null,
     pointerDown: false, deferred: false
   };
@@ -4991,10 +5150,24 @@ function runInWorker(program, files, serialized, decision) {
   // Trinket's fake socket had no readyState, so the message was never SENT.
   // Fixed in #279; the figure is now fitted after it exists, by scaling dpi.
   //
-  // This width survives for one job only: the pane fit's own first measurement
-  // needs a number before #graphic is visible. #graphic is still HIDDEN at this
-  // point (showGraphic() runs when the first figure arrives), so its
-  // clientWidth is 0. Measure a visible ancestor.
+  // DEAD PAYLOAD, kept only because removing it is a protocol change. Nothing
+  // reads this. It is computed here, passed to workerClient.run below, carried
+  // across by worker-client.js and destructured in pyodide-worker.js -- and no
+  // code on either side consumes the value.
+  //
+  // Both comments that used to describe it named a consumer, and they named
+  // DIFFERENT ones: this one said the pane fit's first measurement needed it,
+  // the worker's said "the page uses it for the first fit". Neither was true.
+  // The pane fit's first measurement is paneFitBox(), which reads
+  // #graphic-wrap / #graphic live from the DOM at the moment of the fit. This
+  // value predates that design and outlived it.
+  //
+  // The measurement below is still correct for what it does -- #graphic is
+  // HIDDEN at this point (showGraphic() runs when the first figure arrives) so
+  // its clientWidth is 0, hence the visible-ancestor walk -- it simply has no
+  // consumer. Left in place rather than removed because the worker message
+  // shape is shared with other branches in flight; deleting it belongs in its
+  // own change.
   var graphicWidth = 0;
   ['graphic', 'outputContainer', 'codeOutput'].forEach(function(id) {
     if (graphicWidth) return;

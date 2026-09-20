@@ -140,6 +140,11 @@ function readProbe(page) {
     return {
       box: one.box,
       pendingFits: one.pendingFits,
+      // seq/seqAtFit are what the classifier actually decides on since
+      // 7d57c8f. Exposed here for the interlock test below, which is the only
+      // thing in the suite that reads them.
+      seq: one.seq,
+      seqAtFit: one.seqAtFit,
       canvas: { w: c.clientWidth, h: c.clientHeight },
       kinds: window.__trinketPaneFit.classified.map(e => e.kind),
       log: window.__trinketPaneFit.classified.map(e => `${e.kind}:${e.w}x${e.h}`),
@@ -305,6 +310,348 @@ for (const [label, query] of [['worker', '?runtime=worker'], ['main', '?runtime=
       const refit = await downloadFigsize(page);
       expect(refit.px, `a fit after a drag moved figsize: ${after.px} -> ${refit.px}`)
         .toEqual(after.px);
+    });
+
+    test(`${label}: three fits in flight, four times over, never ratchet figsize`, async ({ page }) => {
+      // THE RATCHET COPILOT FOUND ON #305, as a test rather than as an argument.
+      //
+      // paneFit caps `pendingFits` at 2 (pyodide.js:3954) and sends
+      // unconditionally two lines later, so with THREE fits in flight the
+      // counter reads 2, three echoes come back, and the third finds the
+      // counter at 0. Under the old classifier -- `st.pendingFits > 0 &&
+      // st.seq === st.seqAtFit` -- that third echo fell through to the drag
+      // branch and handle_resize recomputed figsize from CSS pixels.
+      //
+      // WHY THE OTHER TWO TESTS IN THIS FILE CANNOT SEE IT. Both walk the pane
+      // one width at a time with a 3.5 s settle between, which produces one fit
+      // at a time by construction; the state is never reached. And the only
+      // thing either asserts about the counter is `toBeLessThanOrEqual(2)`,
+      // which is satisfied by the 0 that IS the defect. An upper bound cannot
+      // detect an undercount, so the counter is not the observable -- the
+      // CLASSIFICATION of the third echo is.
+      //
+      // THE LEVER, ported from harness/pw/ratchet-repro.js. Wrap
+      // `mpl.figure.prototype.send_message` and hold outgoing
+      // 'trinket_pane_fit' messages, change the box three times, then release
+      // them spaced apart. The page's own logic is untouched: the same three
+      // messages are sent, just delivered late, which is what a slow worker
+      // does. Holding is what makes "three in flight" deterministic rather than
+      // a race against the round trip (9-12 ms worker, 104-117 ms main), and a
+      // race is not something to ship in a spec.
+      //
+      // Two properties of that rig are load-bearing and were both learned by
+      // getting them wrong:
+      //
+      //   WIDTH, not height. dpi = min(w/4.8, h/3.6). At a width-bound
+      //   viewport, varying the wrap's HEIGHT gives three distinct box
+      //   signatures that all fit to ONE size -- zero div resizes, zero echoes,
+      //   and a green test that provoked nothing.
+      //
+      //   SPACED on release, not released together. Three resizes inside one
+      //   animation frame coalesce into a single ResizeObserver delivery, so
+      //   three sends produce one echo and the third -- the only one under
+      //   test -- never exists.
+      //
+      // WHY FOUR CYCLES AND NOT ONE, which is the part that makes this a
+      // ratchet test rather than a classifier test. Measured against the
+      // defective classifier, one provocation moves figsize by NOTHING: the
+      // phantom drag recomputes figsize from a canvas size the fit itself just
+      // asked for, so at dpr 1 it round-trips back to 4.8 x 3.6 in exactly and
+      // the downloaded PNG is still 1440 x 1080. A single cycle is therefore
+      // invisible in the file, and a one-cycle version of this test would have
+      // shipped a download assertion that cannot fail. Four cycles at different
+      // widths accumulate the truncation, monotonically and in one direction --
+      // which is what the word ratchet means:
+      //
+      //   cycle 0  echo:496x372 echo:446x334 drag:396x297   1440x1080
+      //   cycle 1  echo:598x448 echo:538x403 drag:478x358   1440x1078
+      //   cycle 2  echo:518x387 echo:468x350 drag:418x313   1440x1078
+      //   cycle 3  echo:558x417 echo:498x372 drag:438x327   1440x1075
+      //
+      // Identical on both runtimes. Height only: width is the bound dimension
+      // here, so 1440 never moves and only the free dimension drifts. Five
+      // pixels at 300 dpi is 0.0167 in -- invisible on screen, permanent in
+      // every file the student downloads afterwards.
+      await runFigure(page, query, { width: 1280, height: 900 });
+
+      const before = await downloadFigsize(page);
+      expect(before.png, `baseline is a PNG: ${JSON.stringify(before)}`).toBe(true);
+
+      // Four triples, each one a different span, so no cycle repeats another's
+      // box signatures -- a repeat would be dropped by the signature check at
+      // pyodide.js:3937 and the cycle would send fewer than three.
+      //
+      // THE THINNEST CONSTANT IN THIS TEST is the 600px in cycle 1. dpi =
+      // min(w/4.8, h/3.6), and at this viewport width stops binding at a pane
+      // of about 634px, so 600 sits roughly 27px of pane height from the point
+      // where HEIGHT becomes the bound dimension -- at which case varying width
+      // would stop changing the fitted size and the cycle would send three and
+      // echo fewer. It fails loudly rather than silently (the delivery guard
+      // below catches it), but anyone widening these numbers should know the
+      // ceiling is there.
+      const CYCLES = [
+        ['498px', '448px', '398px'],
+        ['600px', '540px', '480px'],
+        ['520px', '470px', '420px'],
+        ['560px', '500px', '440px'],
+      ];
+      const every = [];
+
+      for (let cycle = 0; cycle < CYCLES.length; cycle++) {
+        const out = await page.evaluate(async (widths) => {
+          const held = [];
+          const proto = window.mpl.figure.prototype;
+          const orig = proto.send_message;
+          proto.send_message = function (type, payload) {
+            if (type === 'trinket_pane_fit') { held.push([this, type, payload]); return; }
+            return orig.call(this, type, payload);
+          };
+          const wrap = document.getElementById('graphic-wrap');
+          const start = window.__trinketPaneFit.classified.length;
+          for (const w of widths) {
+            wrap.style.width = w;
+            window.__trinketPaneFit.fit();
+            await new Promise(r => setTimeout(r, 30));
+          }
+          const sentWhileHeld = held.length;
+          const stMid = window.__trinketPaneFit.state();
+          const pendingAtRelease = stMid[Object.keys(stMid)[0]].pendingFits;
+          proto.send_message = orig;
+          for (const [fig, type, payload] of held) {
+            const before = window.__trinketPaneFit.classified.length;
+            orig.call(fig, type, payload);
+            // WAIT FOR THE DELIVERY, do not sleep a fixed gap. This used to be
+            // `setTimeout(120)`, which is only 3 ms beyond the measured
+            // 104-117 ms main-thread round trip: under load the previous
+            // release could still be in flight when the next one went out,
+            // both deliveries would land in one animation frame, and the
+            // ResizeObserver would coalesce them. The delivery guard below
+            // then FAILS -- so the failure mode is a flake, not a false pass,
+            // which in this file is the worse of the two. Its own header says
+            // a flaky test here reads as the ratchet coming back.
+            //
+            // This does NOT weaken the precondition. All three fits left
+            // paneFit while the messages were held, so they are already in
+            // flight by every measure the classifier uses -- `sentWhileHeld`
+            // and `pendingAtRelease` are both captured above, before the first
+            // release. The spacing exists only to stop the browser merging
+            // three deliveries into one, so pacing it on the delivery itself
+            // is strictly more faithful than pacing it on a clock.
+            const deadline = Date.now() + 5000;
+            while (window.__trinketPaneFit.classified.length === before &&
+                   Date.now() < deadline) {
+              await new Promise(r => setTimeout(r, 20));
+            }
+            // A frame after it lands, so the next release starts its own.
+            await new Promise(r => setTimeout(r, 40));
+          }
+          await new Promise(r => setTimeout(r, 4000));
+          return {
+            sentWhileHeld,
+            pendingAtRelease,
+            log: window.__trinketPaneFit.classified.slice(start).map(e => `${e.kind}:${e.w}x${e.h}`),
+          };
+        }, CYCLES[cycle]);
+
+        const where = `cycle ${cycle} (${CYCLES[cycle].join(' ')})`;
+        every.push(`[${where}] ${out.log.join(' ')}`);
+        const kinds = out.log.map(s => s.split(':')[0]);
+
+        // PRECONDITION, asserted EXACTLY. Three fits left paneFit while their
+        // echoes were held, and the counter stopped at its cap -- which is the
+        // undercount itself, pinned in the direction the six existing
+        // `toBeLessThanOrEqual(2)` assertions on this branch cannot pin. If the
+        // signature check dropped one of the three, or the cap moved, this says
+        // so rather than quietly measuring two fits.
+        expect(out.sentWhileHeld, `${where}: three fits sent while echoes were held`).toBe(3);
+        // This one pins BOOKKEEPING, not a decision: 7d57c8f deliberately
+        // demoted pendingFits out of the discriminator, and `sentWhileHeld`
+        // above already establishes the precondition on its own. It is kept as
+        // documentation of the state that used to break the classifier. If
+        // pendingFits is ever retired, this is the assertion that will look
+        // like a real regression and is not one.
+        expect(out.pendingAtRelease, `${where}: pendingFits pinned at its cap (bookkeeping)`).toBe(2);
+
+        // VACUITY GUARD, COUNTING DELIVERIES AND NOT ECHOES.
+        //
+        // The design note for this test (harness/panefit-coverage-round7.md,
+        // the addendum) prescribed guarding on the ECHO count, reasoning that
+        // `pendingFits` is the broken quantity and cannot witness its own
+        // failure. That is right and it does not go far enough: on the defect
+        // the third delivery is classified a DRAG, so the echo count drops to
+        // 2 and an echo-based guard fires FIRST -- reporting "the releases
+        // coalesced" for a run in which nothing coalesced. A vacuity guard must
+        // not be computed from the quantity under test, and here the
+        // classification is that quantity. The delivery count is independent of
+        // it: three held fits released 120 ms apart give three deliveries
+        // whatever the classifier calls them, verified on both runtimes against
+        // both versions of the classifier.
+        // 'chrome' is EXCLUDED because it is a note without a delivery behind
+        // it: paneFitNote('chrome', ...) is appended from the echo's own rAF
+        // (pyodide.js:4347) when the chrome is re-measured, so two real
+        // deliveries plus one chrome note would satisfy a raw log count. The
+        // test would still go red on the echo count below, but it would go red
+        // with the wrong message -- which is the same class of defect this
+        // guard was rewritten to avoid, one step further along.
+        expect(out.log.filter(s => !s.startsWith('chrome')).length,
+          `${where}: each released fit must produce a delivery -- ${out.log.join(' ')}`)
+          .toBeGreaterThanOrEqual(3);
+
+        // MECHANISM. Nobody touched the figure, so nothing here may be read as
+        // a drag. `st.seq === st.seqAtFit` asks the question the count was
+        // standing in for -- has a gesture begun since we last asked Python for
+        // a size -- and no gesture began.
+        expect(kinds.filter(k => k === 'drag'), `${where}: a fit was read as a drag -- ${out.log.join(' ')}`)
+          .toHaveLength(0);
+        // The same fact from the other side, EXACTLY rather than as a bound,
+        // because an undercount is the failure this test exists for.
+        expect(kinds.filter(k => k === 'echo').length,
+          `${where}: every released fit came back as an echo -- ${out.log.join(' ')}`).toBe(3);
+      }
+
+      // SYMPTOM, and it is an independent detector rather than decoration:
+      // with the two mechanism assertions above removed and the classifier
+      // reverted, this one still fails, 1440x1080 -> 1440x1075 on both
+      // runtimes. Compared in whole PIXELS, not rounded inches -- the drift is
+      // hundredths of an inch and invisible on screen, because a figure 1%
+      // shorter in inches and 1% denser in dpi occupies the same pixels.
+      const after = await downloadFigsize(page);
+      expect(after.png, `post-provocation download is a PNG: ${JSON.stringify(after)}`).toBe(true);
+      expect(after.px, `in-flight fits ratcheted figsize: ${before.px} -> ${after.px}\n${every.join('\n')}`)
+        .toEqual(before.px);
+    });
+
+    test(`${label}: a tab switch after a corner drag is a re-show, not a drag`, async ({ page }) => {
+      // THE ONE STATE NOTHING ELSE IN THE SUITE ENTERS: seq !== seqAtFit.
+      //
+      // Found by an adversarial mutation pass, not by reading. Subordinating
+      // the re-show test to the gesture test -- so a re-delivery only reaches
+      // it when seq === seqAtFit -- leaves every other test in this file and
+      // in panefit.spec.js GREEN, including both corner-drag tests and the
+      // re-show test itself. The re-show test only ever exercises an ORDINARY
+      // re-show, where no gesture has happened and seq === seqAtFit, so the
+      // echo branch would have caught it anyway.
+      //
+      // The uncovered path is the one a student actually walks: resize the
+      // figure by its corner, click to Instructions and back. A corner drag
+      // bumps seq and does NOT change #graphic-wrap's box, so the pointerup
+      // fit is skipped by the box-signature check (pyodide.js:3937) before it
+      // can stamp seqAtFit -- leaving seq ahead of seqAtFit indefinitely. The
+      // re-delivery on show then misses the echo branch, and if the re-show
+      // test is not above the drag branch it lands in the drag branch and
+      // handle_resize recomputes figsize from CSS pixels. That is the ratchet,
+      // reached without a single fit being misclassified.
+      //
+      // So this test exists because `fd5fbf7`'s claim that the placement
+      // invariant was pinned was true only for the ordinary case.
+      await runFigure(page, query, { width: 1280, height: 900 });
+
+      await slowCornerDrag(page, -140, -90);
+
+      const dragged = await downloadFigsize(page);
+      expect(dragged.png, `post-drag download is a PNG: ${JSON.stringify(dragged)}`).toBe(true);
+
+      // PRECONDITION, asserted rather than assumed, because the whole test is
+      // about a state and a test that never reaches it proves nothing. If the
+      // pointerup fit were NOT skipped it would stamp seqAtFit, the two would
+      // agree, and everything below would be a duplicate of the ordinary
+      // re-show test at three times the runtime.
+      const before = await readProbe(page);
+      expect(before.seq, `the drag never bumped seq: ${JSON.stringify(before)}`).toBeGreaterThan(0);
+      expect(before.seqAtFit,
+        `the pointerup fit was not skipped, so this is not the state under test: ${JSON.stringify(before)}`)
+        .not.toBe(before.seq);
+
+      const n = before.kinds.length;
+      await page.evaluate(() => { $(document).trigger('trinket.instructions.view'); });
+      await page.waitForTimeout(1200);
+      await page.evaluate(() => { $(document).trigger('trinket.output.view'); });
+      await page.waitForTimeout(2500);
+
+      const after = await readProbe(page);
+      const added = after.log.slice(n);
+
+      // MECHANISM. With seq ahead of seqAtFit the echo branch cannot catch
+      // this, so the re-show branch is the only thing standing between the
+      // student and a recomputed figsize.
+      expect(added.filter(s => s.startsWith('reshow')).length,
+        `the post-drag re-show was not classified as one: ${added.join(' ')}`).toBe(1);
+      expect(added.filter(s => s.startsWith('drag')),
+        `the post-drag re-show was read as a drag: ${added.join(' ')}`).toHaveLength(0);
+
+      // SYMPTOM. The shape the student chose with the corner drag survives the
+      // tab switch, in the file they download.
+      const reshown = await downloadFigsize(page);
+      expect(reshown.px,
+        `a tab switch after a drag moved figsize: ${dragged.px} -> ${reshown.px}. Notes: ${added.join(' ')}`)
+        .toEqual(dragged.px);
+    });
+
+    test(`${label}: a fit during a held gesture never stamps seqAtFit`, async ({ page }) => {
+      // THE INTERLOCK, which 7d57c8f leans on and nothing asserted.
+      //
+      // The classifier's whole question is `st.seq === st.seqAtFit` -- has a
+      // gesture begun since we last asked Python for a size. That is only
+      // exact because paneFit returns at `if (st.pointerDown)` BEFORE it
+      // stamps seqAtFit, and the single pointerdown listener does
+      // `st.seq++; st.pointerDown = true;` in one synchronous statement. Move
+      // the stamp above the guard and the interlock is gone.
+      //
+      // THE FIRST VERSION OF THIS TEST WAS VACUOUS AND IS WORTH RECORDING. It
+      // did a six-sample corner drag and asserted seqAtFit had not moved --
+      // which passes with the stamp moved above the guard, because a plain
+      // corner drag never calls paneFit AT ALL. canvas_div is what resizes,
+      // #graphic-wrap is what the observer watches, so no fit is issued during
+      // the gesture and there is nothing for the guard to stop. The assertion
+      // held for a reason unrelated to the thing it claimed to pin.
+      //
+      // The provocation has to CALL paneFit while the pointer is down, which
+      // `__trinketPaneFit.fit()` does directly and deterministically -- no
+      // viewport race, no reliance on the native resizer.
+      //
+      // If this breaks, a real drag gets classified as an echo: Python drops
+      // the resize and the student's corner drag does nothing at all.
+      await runFigure(page, query, { width: 1280, height: 900 });
+
+      const before = await readProbe(page);
+      // Boot leaves the two agreeing -- the startup fit stamps seqAtFit. Said
+      // out loud because the comparison below is only meaningful if they
+      // started equal.
+      expect(before.seqAtFit, `boot should leave the two agreeing: ${JSON.stringify(before)}`)
+        .toBe(before.seq);
+
+      const held = await page.evaluate(() => {
+        const div = document.querySelector('#graphic canvas').parentNode;
+        const opts = { bubbles: true, composed: true, pointerId: 1, pointerType: 'touch', isPrimary: true };
+        div.dispatchEvent(new PointerEvent('pointerdown', opts));
+        // The box must CHANGE, or paneFit returns at the signature check
+        // (pyodide.js:3937) on its way past and the guard is never the thing
+        // that stopped it -- the same vacuity as the drag version, one step
+        // further in.
+        document.getElementById('graphic-wrap').style.width = '470px';
+        window.__trinketPaneFit.fit();
+        const st = window.__trinketPaneFit.state();
+        const one = st[Object.keys(st)[0]];
+        const out = { seq: one.seq, seqAtFit: one.seqAtFit, pointerDown: one.pointerDown, deferred: one.deferred };
+        div.dispatchEvent(new PointerEvent('pointercancel', opts));
+        return out;
+      });
+
+      // VACUITY GUARDS. The gesture has to be live and the fit has to have
+      // reached the guard, or seqAtFit standing still proves nothing.
+      expect(held.pointerDown, `the synthetic pointerdown did not register: ${JSON.stringify(held)}`)
+        .toBe(true);
+      expect(held.seq, `pointerdown did not bump seq: ${JSON.stringify(held)}`)
+        .toBeGreaterThan(before.seq);
+      expect(held.deferred, `the fit did not reach the pointerDown guard: ${JSON.stringify(held)}`)
+        .toBe(true);
+
+      // THE INVARIANT. paneFit returned at the guard without stamping, so
+      // seqAtFit still holds the value boot left it with and the classifier
+      // can still tell a gesture from an echo.
+      expect(held.seqAtFit,
+        `a fit stamped seqAtFit mid-gesture: ${JSON.stringify(held)}`)
+        .toBe(before.seqAtFit);
     });
   });
 }
