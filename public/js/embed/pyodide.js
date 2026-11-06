@@ -1006,8 +1006,9 @@ function ensurePyodide() {
   return pyodideLoading;
 }
 
-// Writes secondary .py files to the Pyodide FS so `import` works, and returns
-// the contents of the main file to execute.
+// Writes secondary files to the Pyodide FS and returns the contents of the
+// main file to execute. Every file goes, not just .py: `import helper` needs
+// helper.py, and open('data.txt') / np.loadtxt('data.txt') need the data (#373).
 function syncFilesToFS(files, main) {
   var prog = '', key;
   for (key in files) {
@@ -1015,7 +1016,7 @@ function syncFilesToFS(files, main) {
     if (key === main) {
       prog = files[key];
     }
-    else if (/\.py$/.test(key)) {
+    else {
       try { pyodide.FS.writeFile(key, files[key]); } catch (e) {}
     }
   }

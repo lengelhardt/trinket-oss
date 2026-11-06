@@ -17,6 +17,19 @@
 
   var PROTOCOL_VERSION = 1;
 
+  // Writes every file the trinket ships to the Pyodide FS, not just .py: a
+  // program that does np.loadtxt('data.txt') or open('data.txt') needs the
+  // data file on disk as much as `import helper` needs helper.py (#373). The
+  // main file is in `files` too (it also travels as `source`); writing it is
+  // harmless. Pure over FS so it can be unit-tested.
+  function writeSecondaryFiles(FS, files) {
+    if (!files) return;
+    for (var name in files) {
+      if (!Object.prototype.hasOwnProperty.call(files, name)) continue;
+      try { FS.writeFile(name, files[name]); } catch (e) {}
+    }
+  }
+
   // Pure so it can be unit-tested; the live path is a browser spec.
   function buildRunReply(id, result) {
     if (result && result.ok === false) {
@@ -931,16 +944,10 @@
     var run = function(msg) {
       currentRunId = msg.id;
 
-      // Secondary .py modules must exist in the worker's own filesystem before
-      // the program imports them — the same job syncFilesToFS() does on the
-      // main thread. The main file is passed as `source` and is not written.
-      if (msg.files) {
-        for (var name in msg.files) {
-          if (!Object.prototype.hasOwnProperty.call(msg.files, name)) continue;
-          if (!/\.py$/.test(name)) continue;
-          try { pyodide.FS.writeFile(name, msg.files[name]); } catch (e) {}
-        }
-      }
+      // Secondary files must exist in the worker's own filesystem before the
+      // program imports or opens them — the same job syncFilesToFS() does on
+      // the main thread. The main file is passed as `source` and is not written.
+      writeSecondaryFiles(pyodide.FS, msg.files);
 
       var source = msg.source || '';
       // Shadow guard, matching the main thread's userShadowsConsole(): if the
@@ -1105,6 +1112,7 @@
   }
 
   var api = { buildRunReply: buildRunReply, createSceneChannel: createSceneChannel,
+              writeSecondaryFiles: writeSecondaryFiles,
               PROTOCOL_VERSION: PROTOCOL_VERSION };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
 })(typeof self !== 'undefined' ? self : this);
